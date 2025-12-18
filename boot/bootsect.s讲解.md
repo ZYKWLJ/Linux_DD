@@ -50,3 +50,14 @@ _start:
 	rep					#重复执行并递减cx的值
 	movsw				#从内存[si]处移动cx个字到[di]处
 ```
+
+## (三)初始化内存架构，将ds、es、ss赋值为cs的值，即0x9000,并且将sp赋值为0xFF00
+```s
+	ljmp	$INITSEG, $go	#段间跳转，这里INITSEG指出跳转到的段地址，解释了cs的值为0x9000
+go:	mov	%cs, %ax		#将ds，es，ss都设置成移动后代码所在的段处(0x9000)
+	mov	%ax, %ds
+	mov	%ax, %es
+# put stack at 0x9ff00.
+	mov	%ax, %ss
+	mov	$0xFF00, %sp		# arbitrary value >>512
+```

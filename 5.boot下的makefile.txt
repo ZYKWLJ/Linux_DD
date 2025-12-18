@@ -1,0 +1,33 @@
+# 一、源代码：
+```makefile
+include ../Makefile.header
+
+LDFLAGS	+= -Ttext 0
+
+all: bootsect setup
+
+bootsect: bootsect.s
+	@$(AS) -o bootsect.o bootsect.s
+	@$(LD) $(LDFLAGS) -o bootsect bootsect.o
+	@$(OBJCOPY) -R .pdr -R .comment -R.note -S -O binary bootsect
+
+
+setup: setup.s
+	@$(AS) -o setup.o setup.s
+	@$(LD) $(LDFLAGS) -o setup setup.o
+	@$(OBJCOPY) -R .pdr -R .comment -R.note -S -O binary setup
+
+head.o: head.s
+	@$(AS) -o head.o head.s
+
+clean:
+	@rm -f bootsect bootsect.o setup setup.o head.o
+```
+# 二、功能解释
+## (一)整体功能解释
+这份 Makefile 是 Linux 0.11 内核启动阶段（boot）的构建脚本，核心作用是把汇编源文件
+（bootsect.s、setup.s、head.s）编译、链接成符合启动要求的二进制文件（bootsect、setup），
+同时提供清理编译产物的功能。Linux 0.11 的启动流程依赖这两个二进制文件：bootsect 是引导扇区（512 字节），
+负责加载 setup 和内核；setup 负责初始化硬件、传递参数给内核。
+
+https://www.doubao.com/thread/wdd7cf201b14d6932

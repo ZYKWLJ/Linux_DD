@@ -231,3 +231,19 @@ end_move:
 	lidt	idt_48		# load idt with 0,0
 	lgdt	gdt_48		# load gdt with whatever appropriate
 ```
+
+## (五)开启A20地址线
+```s
+# that was painless, now we enable A20
+
+	#call	empty_8042	# 8042 is the keyboard controller
+	#mov	$0xD1, %al	# command write
+	#out	%al, $0x64
+	#call	empty_8042
+	#mov	$0xDF, %al	# A20 on
+	#out	%al, $0x60
+	#call	empty_8042
+	inb     $0x92, %al	# open A20 line(Fast Gate A20).
+	orb     $0b00000010, %al
+	outb    %al, $0x92
+```

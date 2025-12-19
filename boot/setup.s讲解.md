@@ -249,6 +249,7 @@ end_move:
 ```
 
 ## (六)解决一些IBM的遗留的中断覆盖问题
+IBM在违背了Intel的中断默认设定，我们只能重新纠正，对8269芯片进行编程
 ```s
 	mov	$0x11, %al		# initialization sequence(ICW1)
 					# ICW4 needed(1),CASCADE mode,Level-triggered

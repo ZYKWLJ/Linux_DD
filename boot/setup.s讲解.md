@@ -204,3 +204,19 @@ is_disk1:
 	mov	$0x0000, %ax
 	cld			# 'direction'=0, movs moves forward
 ```
+
+## (三)将system模块从0x10000处移动到0x00000处
+```s
+do_move:
+	mov	%ax, %es	# destination segment
+	add	$0x1000, %ax
+	cmp	$0x9000, %ax
+	jz	end_move
+	mov	%ax, %ds	# source segment
+	sub	%di, %di
+	sub	%si, %si
+	mov 	$0x8000, %cx
+	rep
+	movsw
+	jmp	do_move
+```

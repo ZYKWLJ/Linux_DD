@@ -220,3 +220,14 @@ do_move:
 	movsw
 	jmp	do_move
 ```
+
+## (四)加载保护模式下的中断描述符表（IDT）和全局描述符表（GDT）
+```s
+# then we load the segment descriptors
+
+end_move:
+	mov	$SETUPSEG, %ax	# right, forgot this at first. didnt work :-)
+	mov	%ax, %ds
+	lidt	idt_48		# load idt with 0,0
+	lgdt	gdt_48		# load gdt with whatever appropriate
+```

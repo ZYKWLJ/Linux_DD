@@ -279,3 +279,24 @@ IBM在违背了Intel的中断默认设定，我们只能重新纠正，对8269�
 	.word	0x00eb,0x00eb
 	out	%al, $0xA1
 ```
+
+## (七)进入保护模式--将CR0的PE位设置为1
+很简单，就是设置CR0的PE位为1即可，就开启了保护模式，其余的内置功能是CPU硬件做的事。
+```s
+    mov	$0x0001, %ax	# protected mode (PE) bit
+	lmsw	%ax		# This is it!
+	.equ	sel_cs0, 0x0008 # select for code segment 0 (  001:0 :00) 
+	ljmp	$sel_cs0, $0	# jmp offset 0 of code segment 0 in gdt
+```
+上面是linus的实现，这里作者改了一下，换了一种实现，但是总体来说 是不变的
+```s
+	#mov	$0x0001, %ax	# protected mode (PE) bit
+	#lmsw	%ax		# This is it!
+	mov	%cr0, %eax	# get machine status(cr0|MSW)	
+	bts	$0, %eax	# turn on the PE-bit 
+	mov	%eax, %cr0	# protection enabled
+				
+				# segment-descriptor        (INDEX:TI:RPL)
+	.equ	sel_cs0, 0x0008 # select for code segment 0 (  001:0 :00) 
+	ljmp	$sel_cs0, $0	# jmp offset 0 of code segment 0 in gdt
+```

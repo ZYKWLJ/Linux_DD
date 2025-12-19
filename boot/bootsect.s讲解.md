@@ -46,9 +46,9 @@
 这就是汇编固定执行的复制操作，没啥好说的
 ```s
 _start:
-	mov	$BOOTSEG, %ax	#将ds段寄存器设置为0x7C0
+	mov	$BOOTSEG, %ax	#将ds段寄存器设置为0x7C00，即引导区所在的段地址
 	mov	%ax, %ds
-	mov	$INITSEG, %ax	#将es段寄存器设置为0x900
+	mov	$INITSEG, %ax	#将es段寄存器设置为0x9000，即引导区移动到的段地址
 	mov	%ax, %es
 	mov	$256, %cx		#设置移动计数值256字
 	sub	%si, %si		#源地址	ds:si = 0x07C0:0x0000
@@ -95,4 +95,35 @@ load_setup:                 # 标签：加载setup程序的入口
     mov $0x0000, %ax        # ax=0x0000：BIOS 0x13中断的0号功能（重置磁盘控制器）
     int $0x13               # 触发0x13中断：重置磁盘控制器，恢复磁盘初始状态
     jmp load_setup          # 跳回load_setup标签，重新尝试读取扇区（循环直到成功）
+```
+
+## (五)完成了setup的加载后，接下来加载system，所以显示"Loading system ..."字样
+```s
+ok_load_setup:
+# 第一部分：获取磁盘驱动器参数（每磁道扇区数）
+# 这一部分代码的唯一目标是：问 BIOS“软盘驱动器 0（A 盘）的每一个磁道里有多少个扇区”，然后把这个数字记下来，给后面读取磁盘数据用。
+# Get disk drive parameters, specifically nr of sectors/track
+
+	mov	$0x00, %dl        # DL寄存器：指定要查询的驱动器号，0x00表示第一个软盘驱动器(A:)
+	mov	$0x0800, %ax      # AH=0x08（功能号），AL=0x00；BIOS 0x13中断的0x08号功能是获取驱动器参数
+	int	$0x13             # 调用BIOS 0x13中断，执行"获取驱动器参数"功能
+	                        # 中断返回后：CX寄存器低6位=每磁道扇区数，CH=磁道号低8位，CL高2位=磁道号高2位
+	mov	$0x00, %ch        # 将CH清零（只保留CL中的每磁道扇区数）
+	#seg cs                 # 注释的伪指令，作用是指定后续操作的段寄存器为代码段CS
+	mov	%cx, %cs:sectors+0 # 将CX的值（仅CL有效，每磁道扇区数）存入CS段的sectors变量，那么这个变量在哪里呢？(还可以这么玩，牛)
+	mov	$INITSEG, %ax     # 将INITSEG（初始化段地址，如0x9000）加载到AX
+	mov	%ax, %es          # 将AX的值赋给ES段寄存器，重置ES为初始化段
+
+# 第二部分：打印提示信息
+# 这一部分代码的唯一目标是：打印提示信息"IceCityOS is booting ..."到屏幕上。
+	mov	$0x03, %ah        # AH=0x03，BIOS 0x10中断的0x03号功能：读取光标位置
+	xor	%bh, %bh          # BH=0，指定操作的显示页为第0页（默认显示页）
+	int	$0x10             # 调用BIOS 0x10中断，读取光标位置（返回后：DH=行号，DL=列号）
+	
+	mov	$30, %cx          # CX=30，指定要打印的字符串长度（msg1的字符数，这里也不是30啊，咋搞的？）
+	mov	$0x0007, %bx      # BX=0x0007：BL=0x07（字符属性：黑底白字，正常显示），BH=0（显示页0）
+	#lea	msg1, %bp        # 注释的指令：取msg1的有效地址到BP（等价于mov $msg1, %bp）
+	mov     $msg1, %bp       # BP寄存器指向要打印的字符串msg1的起始地址
+	mov	$0x1301, %ax      # AH=0x13（BIOS 0x10中断的0x13号功能：打印字符串），AL=0x01（打印后移动光标）
+	int	$0x10             # 调用BIOS 0x10中断，打印msg1字符串到屏幕
 ```

@@ -110,7 +110,7 @@ ok_load_setup:
 	                        # 中断返回后：CX寄存器低6位=每磁道扇区数，CH=磁道号低8位，CL高2位=磁道号高2位
 	mov	$0x00, %ch        # 将CH清零（只保留CL中的每磁道扇区数）
 	#seg cs                 # 注释的伪指令，作用是指定后续操作的段寄存器为代码段CS
-	mov	%cx, %cs:sectors+0 # 将CX的值（仅CL有效，每磁道扇区数）存入CS段的sectors变量，那么这个变量在哪里呢？(还可以这么玩，牛)
+	mov	%cx, %cs:sectors+0 # 将CX的值（仅CL有效，每磁道扇区数）存入CS段的sectors变量，那么这个变量在哪里呢？在最后面的收尾(还可以这么玩，牛)
 	mov	$INITSEG, %ax     # 将INITSEG（初始化段地址，如0x9000）加载到AX
 	mov	%ax, %es          # 将AX的值赋给ES段寄存器，重置ES为初始化段
 
@@ -229,4 +229,30 @@ kill_motor:
 	outsb
 	pop	%dx
 	ret
+```
+## (七)bootsect.s 结束的收尾工作
+这段代码是bootsect.s（引导扇区代码）的收尾部分，核心作用是定义数据变量、字符串常量、引导扇区标识，以及划分代码 / 数据段边界，是软盘引导扇区必须的 “格式收尾”—— 尤其是**0xAA55标识**，没有它 **BIOS 会认为引导扇区无效。**同时通过边界值的设定，确定bootsect大小为512B,刚好符合规定！
+```s
+# 定义一个字（2字节）变量sectors，初始值0, 前面代码中会把“每磁道扇区数”写入这个变量
+sectors:
+	.word 0
+
+msg1:
+	.byte 13,10 # .byte定义字节：13=回车(CR)，10=换行(LF)，对应键盘的Enter键
+	.ascii "IceCityOS is booting ..."
+	.byte 13,10,13,10 # ; 两个回车换行，让提示语下方留空，排版更整洁
+
+	.org 508 # 汇编伪指令：强制后续代码/数据从偏移地址508开始（距离引导扇区起始位置508字节），为了恰好凑齐512KB！
+
+root_dev:
+	.word ROOT_DEV #定义字变量root_dev，值为宏ROOT_DEV（根设备号，如0x0208=1.2MB软盘），前面代码中会根据软盘类型自动修改这个值
+boot_flag:
+	.word 0xAA55 # 引导扇区标识：必须以0xAA55结尾（低字节55，高字节AA）， BIOS会检查引导扇区最后2字节是否为0xAA55，否则拒绝执行引导扇区，为啥一定要是0xAA55？因为A是AT&T，55是U，所以就是为了纪念在AT&T实验室开发出的Unix操作系统
+	
+	.text
+	endtext:    #标记代码段（.text）的结束位置
+	.data
+	enddata:    #标记数据段（.data）的结束位置
+	.bss
+	endbss:     #标记未初始化数据段（.bss）的结束位置
 ```

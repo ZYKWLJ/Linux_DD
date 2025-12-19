@@ -74,7 +74,7 @@ go:	mov	%cs, %ax		#将ds，es，ss都设置成移动后代码所在的段处(0x9
 	mov	$0xFF00, %sp		# arbitrary value >>512
 ```
 
-## (四)加载setup数据模块到0x90200内存处，共4扇区
+## (四)从软盘加载setup数据模块到0x90200内存处，共4扇区
 
 ```s
 load_setup:                 # 标签：加载setup程序的入口
@@ -126,4 +126,92 @@ ok_load_setup:
 	mov     $msg1, %bp       # BP寄存器指向要打印的字符串msg1的起始地址
 	mov	$0x1301, %ax      # AH=0x13（BIOS 0x10中断的0x13号功能：打印字符串），AL=0x01（打印后移动光标）
 	int	$0x10             # 调用BIOS 0x10中断，打印msg1字符串到屏幕
+```
+## (六)从软盘第二扇区加载system数据模块到0x10000内存处
+核心功能：先加载系统核心到指定内存段，再根据之前获取的**软盘扇区数**自动识别**根设备（root_dev）类型**
+```s
+	mov	$SYSSEG, %ax
+	mov	%ax, %es		# segment of 0x010000
+	call	read_it # 加载system模块
+	call	kill_motor # 给软盘断电，因为我们Linux0.11是从软盘启动的，现在软盘已加载完毕，不需要继续保持电机运行，加载完了后，os就跑在内存里面了，暂时不需要软盘了
+```
+对应的封装函数如下：
+### read_it函数
+```s
+read_it:
+	mov	%es, %ax
+	test	$0x0fff, %ax
+die:	jne 	die			# es must be at 64kB boundary
+	xor 	%bx, %bx		# bx is starting address within segment
+rp_read:
+	mov 	%es, %ax
+ 	cmp 	$ENDSEG, %ax		# have we loaded all yet?
+	jb	ok1_read
+	ret
+ok1_read:
+	#seg cs
+	mov	%cs:sectors+0, %ax
+	sub	sread, %ax
+	mov	%ax, %cx
+	shl	$9, %cx
+	add	%bx, %cx
+	jnc 	ok2_read
+	je 	ok2_read
+	xor 	%ax, %ax
+	sub 	%bx, %ax
+	shr 	$9, %ax
+ok2_read:
+	call 	read_track
+	mov 	%ax, %cx
+	add 	sread, %ax
+	#seg cs
+	cmp 	%cs:sectors+0, %ax
+	jne 	ok3_read
+	mov 	$1, %ax
+	sub 	head, %ax
+	jne 	ok4_read
+	incw    track 
+ok4_read:
+	mov	%ax, head
+	xor	%ax, %ax
+ok3_read:
+	mov	%ax, sread
+	shl	$9, %cx
+	add	%cx, %bx
+	jnc	rp_read
+	mov	%es, %ax
+	add	$0x1000, %ax
+	mov	%ax, %es
+	xor	%bx, %bx
+	jmp	rp_read
+
+read_track:
+	push	%ax
+	push	%bx
+	push	%cx
+	push	%dx
+	mov	track, %dx
+	mov	sread, %cx
+	inc	%cx
+	mov	%dl, %ch
+	mov	head, %dx
+	mov	%dl, %dh
+	mov	$0, %dl
+	and	$0x0100, %dx
+	mov	$2, %ah
+	int	$0x13
+	jc	bad_rt
+	pop	%dx
+	pop	%cx
+	pop	%bx
+	pop	%ax
+	ret
+bad_rt:	mov	$0, %ax
+	mov	$0, %dx
+	int	$0x13
+	pop	%dx
+	pop	%cx
+	pop	%bx
+	pop	%ax
+	jmp	read_track
 ```

@@ -215,3 +215,18 @@ bad_rt:	mov	$0, %ax
 	pop	%ax
 	jmp	read_track
 ```
+### kill_motor函数，软盘电机断电💾
+至此，3段Linux0.11的组成——bootsect、setup、system，都已加载完毕。
+软盘完成了外部存储OS的任务，将其临时断电，释放资源。
+
+无非也就是向某个端口读写，然后就完成了电机断电。
+
+```
+kill_motor:
+	push	%dx
+	mov	$0x3f2, %dx
+	mov	$0, %al
+	outsb
+	pop	%dx
+	ret
+```

@@ -1,4 +1,5 @@
 	.code16
+    .equ SYSSIZE, 0x3000
 	.global _start, begtext, begdata, begbss, endtext, enddata, endbss
 	.text
 	begtext:

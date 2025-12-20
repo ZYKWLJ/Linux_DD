@@ -1,8 +1,11 @@
-# include ../Makefile.header
+include ../Makefile.header
 
-# LDFLAGS	+= -Ttext 0
+LDFLAGS	+= -Ttext 0
 
-# all: bootsect setup
+all: bootsect setup
+
+# 这是源码，但是为了讲解，所以保留了命令输出@，
+# 实际使用时，去不去掉@都可，个人建议不去掉，因为更加直观看到具体编译过程。
 
 # bootsect: bootsect.s
 # 	@$(AS) -o bootsect.o bootsect.s
@@ -21,46 +24,19 @@
 # clean:
 # 	@rm -f bootsect bootsect.o setup setup.o head.o
 
-# test: test.c
-# 	@echo "compiling test.c"
-# 	gcc test.c -o test
-# 	@echo "running test.c"
-# 	./test
-
-# # 1. 定义默认目标：先编译，再运行
-# all: test run
-
-# # 2. 编译规则：仅test.c更新时才重新编译
-# test: test.c
-# 	@echo "compiling test.c"
-# 	gcc test.c -o test.exe
-
-# # 3. 运行规则：依赖test文件，仅test更新时才运行
-# run: test.exe
-# 	@echo "running test.c"
-# 	./test
-
-# # 声明伪目标（避免和同名文件冲突）
-# .PHONY: all run
+bootsect: bootsect.s
+	$(AS) -o bootsect.o bootsect.s
+	$(LD) $(LDFLAGS) -o bootsect bootsect.o
+	$(OBJCOPY) -R .pdr -R .comment -R.note -S -O binary bootsect
 
 
-# 1. 定义默认目标：先编译，再运行
-all: test run
+setup: setup.s
+	$(AS) -o setup.o setup.s
+	$(LD) $(LDFLAGS) -o setup setup.o
+	$(OBJCOPY) -R .pdr -R .comment -R.note -S -O binary setup
 
-# 2. 编译规则：仅test.c更新时才重新编译
-test: test.c
-	@echo "compiling test.c"
-	gcc test.c -o test.exe
+head.o: head.s
+	$(AS) -o head.o head.s
 
-# 3. 运行规则：依赖test文件，仅test更新时才运行
-run: test.exe
-	@echo "running test.c"
-	./test.exe
-
-# 4.清理目标
 clean:
-	@echo "cleaning all exe && obj files"
-	-rm -f *.exe *.o
-
-# 声明伪目标（避免和同名文件冲突）
-.PHONY: all run
+	rm -f bootsect bootsect.o setup setup.o head.o

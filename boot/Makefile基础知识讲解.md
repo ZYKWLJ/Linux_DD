@@ -189,3 +189,46 @@ clean:
 ```
 ![按需编译1](image-20.png)
 ![按需编译2](image-21.png)
+
+### 6.在命令前面加上@表示不打印命令本身，只打印命令执行的输出（如果有）。
+#### 源码：
+```c
+#include <stdio.h>
+int main(void)
+{
+    printf("this is a test---%d\n",c);
+    return 0;
+}
+```
+makefile文件1
+```makefile
+all: a.o
+	@echo "linking a.o b.o"
+	gcc a.o -o ab.exe
+	@echo "running ab.exe"
+	./ab.exe
+
+a.o: a.c
+	@echo "compiling a.c"
+	gcc a.c -c -o a.o
+
+clean:
+	rm -f *.o *.exe
+```
+makefile文件2
+```makefile
+all: a.o
+	@echo "linking a.o b.o"
+	@gcc a.o -o ab.exe
+	@echo "running ab.exe"
+	@./ab.exe
+
+a.o: a.c
+	@echo "compiling a.c"
+	@gcc a.c -c -o a.o
+
+clean:
+	@rm -f *.o *.exe
+```
+命令前加上@和不加@的区别对比
+![命令前加上@和不加@的区别](image-23.png)

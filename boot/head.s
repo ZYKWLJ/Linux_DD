@@ -32,7 +32,7 @@ startup_32:
 	lss stack_start,%esp
 	xorl %eax,%eax
 1:	incl %eax		# check that A20 really IS enabled
-	movl %eax,0x000000	# loop forever if it isn't
+	movl %eax,0x000000	# loop forever if it isn't'
 	cmpl %eax,0x100000
 	je 1b
 
@@ -128,7 +128,7 @@ pg3:
 .org 0x5000
 /*
  * tmp_floppy_area is used by the floppy-driver when DMA cannot
- * reach to a buffer-block. It needs to be aligned, so that it isn't
+ * reach to a buffer-block. It needs to be aligned, so that it isn't'
  * on a 64kB border.
  */
 tmp_floppy_area:
@@ -194,7 +194,7 @@ ignore_int:
  * even cannot be extended past that (ok, but it was cheap :-)
  * I've tried to show which constants to change by having
  * some kind of marker at them (search for "16Mb"), but I
- * won't guarantee that's all :-( )
+ * won't guarantee that's all :-( )'
  */
 .align 2
 setup_paging:
@@ -228,7 +228,7 @@ idt_descr:
 .align 2
 .word 0
 gdt_descr:
-	.word 256*8-1		# so does gdt (not that that's any
+	.word 256*8-1		# so does gdt (not that that's any'
 	.long gdt		# magic number, but it works for me :^)
 
 	.align 8
@@ -237,5 +237,5 @@ idt:	.fill 256,8,0		# idt is uninitialized
 gdt:	.quad 0x0000000000000000	/* NULL descriptor */
 	.quad 0x00c09a0000000fff	/* 16Mb */
 	.quad 0x00c0920000000fff	/* 16Mb */
-	.quad 0x0000000000000000	/* TEMPORARY - don't use */
+	.quad 0x0000000000000000	/* TEMPORARY - don't use' */
 	.fill 252,8,0			/* space for LDT's and TSS's etc */

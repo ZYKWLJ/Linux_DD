@@ -2,7 +2,8 @@
 > [Makefile基础知识讲解](Makefile基础知识讲解.md)（点击跳转至上级目录的说明文档）
 
 # 一、作用：
-1. 将bootsect.s、setup.s链接成二进制文件 2. 将head.s编译成可重定位目标文件.o
+1. 将bootsect.s、setup.s链接成二进制文件 
+2. 将head.s编译成可重定位目标文件.o
 
 # 一、源码：
 ```makefile

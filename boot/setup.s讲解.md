@@ -222,6 +222,8 @@ do_move:
 ```
 
 ## (四)加载保护模式下的中断描述符表（IDT）和全局描述符表（GDT）
+注意了，这里的`lidt	idt_48`表示将idt_48的地址加载到寄存器ldtr中，`lgdt	gdt_48`表示将gdt_48的地址加载到寄存器gdtr中，都是为了告知CPU中断向量表和全局描述符表的地址地址。
+
 ```s
 # then we load the segment descriptors
 
@@ -230,6 +232,39 @@ end_move:
 	mov	%ax, %ds
 	lidt	idt_48		# load idt with 0,0
 	lgdt	gdt_48		# load gdt with whatever appropriate
+```
+
+这两个表的具体内容如下：
+
+这些是GDT和idt的具体设置，这里作者只设置了GDT的3个描述符，每一个8字节，第一个是空的，第2个是代码段，第3个是数据段。
+由此可以看出，这里的IDT并没有向GDT一样设置具体处理程序的地址。
+
+```s
+gdt:
+# 8字节，一个表项
+# 第1个表项
+	.word	0,0,0,0		# dummy
+
+# 第2个表项
+	.word	0x07FF		# 8Mb - limit=2047 (2048*4096=8Mb)
+	.word	0x0000		# base address=0
+	.word	0x9A00		# code read/exec
+	.word	0x00C0		# granularity=4096, 386
+
+# 第3个表项
+	.word	0x07FF		# 8Mb - limit=2047 (2048*4096=8Mb)
+	.word	0x0000		# base address=0
+	.word	0x9200		# data read/write
+	.word	0x00C0		# granularity=4096, 386
+
+idt_48:
+	.word	0			# idt limit=0
+	.word	0,0			# idt base=0L
+
+gdt_48:
+	.word	0x800			# gdt limit=2048, 256 GDT entries
+	.word   512+gdt, 0x9		# gdt base = 0X9xxxx, 
+	# 512+gdt is the real gdt after setup is moved to 0x9020 * 0x10
 ```
 
 ## (五)开启A20地址线
@@ -281,7 +316,11 @@ IBM在违背了Intel的中断默认设定，我们只能重新纠正，对8269�
 ```
 
 ## (七)进入保护模式--将CR0的PE位设置为1
-很简单，就是设置CR0的PE位为1即可，就开启了保护模式，其余的内置功能是CPU硬件做的事。
+进入保护模式很简单，就是设置CR0的PE位为1即可，就开启了保护模式，其余的内置功能是CPU硬件做的事。
+不过，我们需要着重讲解进入保护模式和实模式的区别！
+
+先给出进入保护模式的代码：
+
 ```s
     mov	$0x0001, %ax	# protected mode (PE) bit
 	lmsw	%ax		# This is it!
@@ -299,4 +338,101 @@ IBM在违背了Intel的中断默认设定，我们只能重新纠正，对8269�
 				# segment-descriptor        (INDEX:TI:RPL)
 	.equ	sel_cs0, 0x0008 # select for code segment 0 (  001:0 :00) 
 	ljmp	$sel_cs0, $0	# jmp offset 0 of code segment 0 in gdt
+```
+再着重讲解实模式和保护模式的区别！
+
+### 1.实模式、保护模式的区别
+注意下面说的都是未经过分页机制的，如果需要分页的话，以下的物理地址均改为线性地址。
+
+#### 相同点：
+实模式、保护模式都需要通过段式管理，物理地址(**如果需要分页的话，这里改为线性地址**)，由段基地址、段偏移来共同计算。
+
+#### 不同点：
+##### 实模式寻址
+- 实模式下，物理地址=段基地址<<4+偏移地址。其中段基地址存放在段寄存器里，偏移地址存放在ip寄存器里。
+
+##### 保护模式寻址
+- 保护模式下，物理地址依然有段基地址和偏移地址组合而成，只不过，段基地址的获取有异。我们存放在段基地址里面的是段选择子，段选择子结构如下：
+
+![段选择子结构=>段描述符索引12位，TI 1位，RPL 2位](image.png)
+
+通过段选择子的高12位，可以找到段描述符索引，由此可以找到首地址存放在gdtr寄存器里的全局描述符表中具体的全局描述符表项。这个表项里面有段基地址(分散的，需要组合)，用此段基地址，再与偏移地址相加，就得到了物理地址。
+
+=====注意点====
+
+(注意这里是直接相加了，并没有再次左移4位，因为相加后，已经有32位地址了，足够了，前面左移是因为只有16位，不足)
+
+gdtr寄存器，由两部分构成，GDT表的内存起始地址，GDT界限
+![gdtr寄存器](image-1.png)
+
+段描述符表结构，从这里也可以看出，段机制的构成
+![段描述符表](image-2.png)
+
+段描述符表项结构，由此可以看到，我们的基地址确实是分散在8字节表项中的
+![段描述符表项结构，由此可以看到，我们的基地址确实是分散在8字节表项中的](image-3.png)
+
+
+## (八)在保护模式下，跳转到0地址处，走到head.s执行
+代码为：
+```s
+	.equ	sel_cs0, 0x0008 # select for code segment 0 (  001:0 :00) 
+	ljmp	$sel_cs0, $0	# jmp offset 0 of code segment 0 in gdt
+```
+
+### 关于GDT和idt的具体设置
+请注意，这里已经进入了保护模式了，所以接下来跳转需要用到段选择子的知识。具体见上面的讲解。
+
+
+## (九)一些收尾工作
+最后就是一些收尾工作，没啥好说的。
+```s
+print_hex:
+	mov $4,%cx
+	mov %ax,%dx
+
+print_digit:
+	rol $4,%dx	#循环以使低4位用上，高4位移至低4位
+	mov $0xe0f,%ax #ah ＝ 请求的功能值，al = 半个字节的掩码
+	and %dl,%al
+	add $0x30,%al
+	cmp $0x3a,%al
+	jl outp
+	add $0x07,%al
+
+outp:
+	int $0x10
+	loop print_digit
+	ret
+#打印回车换行
+print_nl:
+	mov $0xe0d,%ax
+	int $0x10
+	mov $0xa,%al
+	int $0x10
+	ret
+
+msg2:
+	.byte 13,10
+	.ascii "Now we are in setup ..."
+	.byte 13,10,13,10
+cur:
+	.ascii "Cursor POS:"
+mem:
+	.ascii "Memory SIZE:"
+cyl:
+	.ascii "KB"
+	.byte 13,10,13,10
+	.ascii "HD Info"
+	.byte 13,10
+	.ascii "Cylinders:"
+head:
+	.ascii "Headers:"
+sect:
+	.ascii "Secotrs:"
+.text
+endtext:
+.data
+enddata:
+.bss
+endbss:
 ```

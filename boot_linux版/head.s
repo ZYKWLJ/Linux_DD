@@ -234,7 +234,9 @@ gdt_descr:
 	.align 8
 idt:	.fill 256,8,0		# idt is uninitialized
 
-gdt:	.quad 0x0000000000000000	/* NULL descriptor */
+gdt:	
+    
+    .quad 0x0000000000000000	/* NULL descriptor */
 	.quad 0x00c09a0000000fff	/* 16Mb */
 	.quad 0x00c0920000000fff	/* 16Mb */
 	.quad 0x0000000000000000	/* TEMPORARY - don't use' */

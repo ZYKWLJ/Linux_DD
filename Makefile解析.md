@@ -31,12 +31,13 @@ LD	=ld
 # 虚拟行16: 变量定义 - 链接器参数（核心）
 LDFLAGS	  = -m i386pe   -Ttext 0 -e startup_32 -s -M --image-base 0x0000 
 # 解释：
-# -m i386pe：指定目标架构为32位x86 PE格式（适配Windows交叉编译）
-# -Ttext 0：代码段起始地址设为0
-# -e startup_32：程序入口点为startup_32函数
-# -s：剥离符号表（减小文件体积）
-# -M：输出链接映射信息
-# --image-base 0x0000：镜像基地址设为0
+# 链接参数（内核定制）：
+# ✅ -m i386pe：生成 32 位 Windows PE 格式（适配 MinGW 交叉编译）；
+# ✅ -Ttext 0：强制代码段起始地址为 0（内核最终运行在物理地址 0x100000，链接时先设为 0，启动时重定位）；
+# ✅ -e startup_32：指定程序入口为 head.o 中的 startup_32 函数（内核不依赖 main 作为入口）；
+# ✅ -s：剥离符号表（减小文件体积，不影响运行）；
+# ✅ -M：输出链接映射信息（符号地址、段布局）；
+# ✅ --image-base 0x0000：PE 镜像基地址设为 0（配合 -Ttext 0）；
 
 # 虚拟行17: 变量定义 - C编译器（GCC）+ 架构 + 内存盘参数
 CC	=gcc -march=i386 $(RAMDISK)
@@ -153,7 +154,7 @@ LIBS	=lib/lib.a
 ```
 
 
-## (五)第五部分：核心目标（生成 Boot.img）
+## (五)第五部分：核心目标（生成 Boot.img，即包含整个操作系统内容的引导镜像）
 ```makefile
 # 虚拟行63: 伪目标 - all（默认目标，执行make时优先执行）
 all:	Boot.img
@@ -189,14 +190,15 @@ Boot.img: boot/bootsect.bin boot/setup.bin $(KERNEL_FILE) tools/build.exe Makefi
 # 虚拟行78: 注释目标 - disk（把镜像写入软盘，早期Linux启动方式）
 disk: Image
 	dd bs=8192 if=Image of=/dev/fd0
-# 解释：dd是Linux命令，把Image镜像写入软盘设备/dev/fd0（Windows无此设备）
+# 解释：dd是Linux命令，把Image镜像写入软盘设备/dev/fd0（Windows无此设备），得到一张可以启动linux的软盘。
 ```
 
 ## (六)第六部分：工具编译 + 汇编文件编译
 ```makefile
 # 虚拟行82: 规则 - 编译build.exe（镜像打包工具）
+# 这就是生成的build.exe!
 tools/build.exe: tools/build.c
-	$(CC) $(CFLAGS)	-o tools/build tools/build.c
+	$(CC) $(CFLAGS)	-o tools/build tools/build.c 
 
 # 虚拟行84: 规则 - 编译head.o（内核头部汇编文件，32位入口）
 boot/head.o: boot/head.s
@@ -207,13 +209,20 @@ boot/head.o: boot/head.s
 
 # 虚拟行88: 规则 - 生成system.exe（内核可执行文件）
 tools/system.exe:	boot/head.o init/main.o \
-		$(ARCHIVES) $(DRIVERS) $(MATH) $(LIBS)
-	$(LD) $(LDFLAGS) boot/head.o init/main.o \
+		$(ARCHIVES) $(DRIVERS) $(MATH) $(LIBS) # 依赖定义
+# 链接输入文件，和依赖的定义顺序一样，不能乱！因为链接器按「从左到右」解析符号
+	$(LD) $(LDFLAGS) \ 
+    boot/head.o init/main.o \
 	$(ARCHIVES) \
 	$(DRIVERS) \
 	$(MATH) \
 	$(LIBS) \
 	-o tools/system.exe >system.map
+# 链接的输入文件：
+# 完全复用规则头的依赖列表，顺序绝对不能乱！链接器按「从左到右」解析符号，先加载 head.o（入口），再加载 main.o（初始
+# 化），最后加载库（驱动 / 基础库），确保底层符号能被上层调用（比如 main.o 调用 fs.o 的文件系统函数）；
+
+# 牛逼科斯拉！这里，把全部都拼接起来了！
 # 解释：
 # 链接所有内核模块：头部(head.o) + 主函数(main.o) + 核心模块 + 驱动 + 库
 # >system.map：把链接映射信息输出到system.map（调试用）
@@ -224,7 +233,7 @@ tools/system.exe:	boot/head.o init/main.o \
 ```makefile
 # 虚拟行92: 规则 - 生成数学库math.a
 kernel/math/math.a:kernel/math/math_emulate.o
-#	(cd kernel/math ; make)  # Linux下进入子目录执行make
+#	(cd kernel/math ; make)  # Linux下进入子目录执行make,;表示多条命令一起执行。
 	(cd kernel/math & make)  # Windows下&替代;，执行子目录Makefile
 	
 # 虚拟行95: 规则 - 生成块设备驱动库blk_drv.a
@@ -258,6 +267,7 @@ lib/lib.a:$(LIB_SRC)
 ```
 
 ## (八)第八部分：引导程序编译（bootsect/setup）
+这个竟然是在下面才编译的。
 ```makefile
 # 虚拟行109: 规则 - 生成setup.bin（设置程序，16位汇编）
 boot/setup.bin: boot/setup.asm 
@@ -285,7 +295,8 @@ tmp.s:	boot/bootsect.s tools/system
 # 解释：原逻辑是计算内核大小并写入tmp.s，当前简化为直接拼接
 ```
 
-## (十)第十部分：辅助目标（clean/backup/dep）
+## (十)第十部分：清理（clean/backup/dep）
+
 ```makefile
 # 虚拟行124: 伪目标 - clean（清理编译产物）
 clean:
@@ -311,7 +322,10 @@ clean:
 backup: clean
 	(cd .. ; tar cf - linux | compress16 - > backup.Z)
 	sync
+```
 
+## (十一)第十一部分：依赖(dep)
+```makefile
 # 虚拟行141: 伪目标 - dep（生成依赖文件）
 dep:
 	sed '/\#\#\# Dependencies/q' < Makefile > tmp_make

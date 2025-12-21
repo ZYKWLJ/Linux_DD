@@ -1,7 +1,8 @@
 CC	=gcc # -march=i386 $(RAMDISK)
 AS =as
-CFLAGS	=-Wall -O2 -fomit-frame-pointer -fno-builtin
-
+CFLAGS	=-Wall -m32 -O2 -fomit-frame-pointer -fno-builtin
+LD	=ld
+LDFLAGS	  = -m  i386pe  -M 
 # 显式规则：
 test1.o: test1.c
 	$(CC) $(CFLAGS) \
@@ -20,7 +21,7 @@ test2.o: test2.c
 #  后缀规则 - .c文件转.o文件（C源码编译为目标文件）
 .c.o:
 	$(CC) $(CFLAGS) \
-	-c -o $*.o $<
+	-c -o $*.o $< 
 # 解释：-c: 只编译不链接，生成.o目标文件
 
 # 同理，还有如下的：
@@ -33,6 +34,10 @@ test2.o: test2.c
 .s.o:
 	$(AS) $(CFLAGS) \
 	-c  -o $*.o $<
+
+test1.exe: test1.o
+	$(LD) $(LDFLAGS) \
+	-o test1.exe $< >System.map
 
 clean:
 	rm -rf *.o *.exe *.s

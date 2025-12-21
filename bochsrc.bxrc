@@ -1,0 +1,28 @@
+###############################################################
+# bochsrc.bxrc file for Tinix.
+###############################################################
+
+# how much memory the emulated machine will have
+megs: 32 # 设置虚拟机的内存大小；
+
+# filename of ROM images
+romimage: file=../bochs-2.3.6/BIOS-bochs-latest # romimage：虚拟机的 BIOS 固件文件（对应物理机的主板 BIOS），Bochs 自带的 BIOS-bochs-latest 是通用 x86 BIOS，负责初始化硬件、引导操作系统；
+vgaromimage: file=../bochs-2.3.6/VGABIOS-elpin-2.40 # vgaromimage：显卡 BIOS 文件（VGABIOS），负责初始化显卡、处理文本 / 图形显示，Tinix 是纯文本系统，用 VGABIOS-elpin-2.40 足够；
+
+# what disk images will be used 
+floppya: 1_44=boot.img, status=inserted # 虚拟机的 A 盘（第一个软盘驱动器）：
+floppyb: 1_44=rootimage-0.11.img, status=inserted # 虚拟机的 B 盘（第二个软盘驱动器）：
+ata0-master: type=disk, path="hdc-0.11.img", mode=flat, cylinders=121, heads=16, spt=63 # 虚拟机的主硬盘（ATA 接口第一个主设备）
+# Tinix 启动时，先从 floppya 的 boot.img 加载内核，再挂载 floppyb 或 ata0-master 的根文件系统（对应你之前 Makefile 中的 ROOT_DEV 配置）。
+
+# choose the boot disk.
+boot: a # boot: a 表示虚拟机开机时从 A 盘（floppya） 启动，即优先读取 boot.img 中的引导扇区（bootsect.bin），符合早期 DOS/Linux 从软盘启动的逻辑；
+
+# where do we send log messages?
+log: bochsout.txt # 指定日志消息的输出位置；
+
+# disable the mouse, since Tinix is text only
+mouse: enabled=0 # mouse: enabled=0：禁用鼠标（enabled=0 表示关闭），因为 Tinix 是纯文本系统，无需鼠标操作；
+
+# enable key mapping, using US layout as default.
+keyboard_mapping: enabled=1, map=../bochs-2.3.6/keymaps/x11-pc-us.map # enabled=1：启用键盘映射（enabled=1 表示开启）；

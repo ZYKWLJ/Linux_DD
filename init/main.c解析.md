@@ -28,6 +28,21 @@ static inline _syscall0(int,pause)
 static inline _syscall1(int,setup,void *,BIOS)
 static inline _syscall0(int,sync)
 ```
+这些函数都是宏实现的：这里 _syscall0举例子：
+```c
+#define _syscall0(type, name)                 \
+    type name(void)                           \
+    {                                         \
+        long __res;                           \
+        __asm__ volatile("int $0x80"          \
+                         : "=a"(__res)        \
+                         : "0"(__NR_##name)); \
+        if (__res >= 0)                       \
+            return (type)__res;               \
+        errno = -__res;                       \
+        return -1;                            \
+    }
+```
 
 ### 3.宏定义内联为啥能优化运行性能和避免使用栈？ 
 那么为什么内联了就能优化运行性能和避免使用栈？ 
@@ -127,3 +142,47 @@ main:
 显然，使用宏定义编译出来的汇编代码很简洁，并且关于add宏定义，直接替换成了结果`5`,但是传统的函数，就需要在运行期进行出栈入栈等等操作计算。
 ### 4.宏定义的优化本质
 > 宏定义，本质上是将整个程序的性能提升过程前移，将运算推前到编译期优化，从而保全了运行期的极致性能。
+
+## (二)自己模仿linus实现的用户层宏定义加法函数
+```c
+#include <stdio.h>
+#include <errno.h>  // 补充errno头文件
+
+// 2. 保留你提供的_syscall2宏（仅补充注释）
+#define _syscall2(type, name, type1, arg1, type2, arg2) \
+type name(type1 arg1, type2 arg2) { \
+    long __res; \
+    /* 模拟系统调用：替换int $0x80，避免调用不存在的内核系统调用 */ \
+    /* 真实场景中此处是int $0x80，这里直接计算加法（仅演示） */ \
+    __res = (long)(arg1 + arg2); \
+    /* 保留原宏的返回值逻辑 */ \
+    if (__res >= 0) return (type)__res; \
+    errno = -__res; return -1; \
+}
+
+// 3. 用_syscall2宏生成add系统调用函数（核心：先定义，再调用）
+static inline _syscall2(int, add, int, a, int, b)
+
+// 4. 主函数：调用生成的add函数，而非直接调用宏
+int main(void) {
+    int result = add(1, 5);  // 调用宏生成的add函数
+    printf("result=%d\n", result);    
+    return 0;
+}
+```
+
+预处理后，完成宏替换，如下：
+```c
+static inline int add(int a, int b) { long __res; __res = (long)(a + b); if (__res >= 0) return (int)__res; //得到了add函数了吧！
+# 20 ".\\linus_define.c" 3
+             (*_errno()) 
+# 20 ".\\linus_define.c"
+             = -__res; return -1; }
+
+
+int main(void) {
+    int result = add(1, 5);
+    printf("result=%d\n", result);
+    return 0;
+}
+```

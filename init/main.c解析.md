@@ -186,3 +186,94 @@ int main(void) {
     return 0;
 }
 ```
+
+
+
+## (三)系统调用精讲
+### 1.fork调用详细转化
+详细讲解这句话：
+```c
+static inline _syscall0(int,fork)
+```
+===
+linus对于系统调用的实现如下：
+宏定义：
+```c
+#define __NR_fork 2
+```
+```c
+#define _syscall0(type, name)                 \
+    type name(void)                           \
+    {                                         \
+        long __res;                           \
+        __asm__ volatile("int $0x80"          \
+                         : "=a"(__res)        \
+                         : "0"(__NR_##name)); \
+        if (__res >= 0)                       \
+            return (type)__res;               \
+        errno = -__res;                       \
+        return -1;                            \
+    }
+```
+
+所以调用了这个`_syscall0(int,fork)`函数，会生成：如下.i文件：
+```c
+# 1 ".\\linus_fork.c"
+# 1 "<built-in>"
+# 1 "<command-line>"
+# 1 ".\\linus_fork.c"
+int errno = 0;
+# 15 ".\\linus_fork.c"
+static inline int fork(void)
+{
+    long __res;
+    __asm__ volatile("int $0x80" : "=a"(__res) : "0"(2));
+    if (__res >= 0)
+        return (int)__res;
+    errno = -__res;
+    return -1;
+}
+```
+由此可以看到，这里的`系统调用`马上就`变出来了！`很牛逼！
+### 2.fork转化后源码详细讲解
+
+详解如下：
+- ✅️本质是通过 `int $0x80` 触发`内核中断`，调用`内核编号为 2` 的 `fork 系统调用`；
+- ✅️接收`内核返回的结果`，处理错误（`设置 errno`）后返回`子进程 PID（成功）`或 `-1（失败）`；
+- ✅️static inline 修饰符则是为了`消除函数调用的栈操作`（呼应我们之前聊的内核态 fork 栈安全问题）;
+
+```c
+__asm__ volatile("int $0x80" : "=a"(__res) : "0"(2));
+```
+
+|部分|含义|
+|-|-|
+|__asm__|       `GCC 内嵌汇编`的`关键字`，告诉编译器这里是`汇编代码（等价于 asm）`；|
+|volatile|      `禁止编译器优化`这段汇编代码（必须执行，不能被省略 / 重排），`保证系统调用的原子性`；|
+|"int $0x80"|   x86 架构的中断指令：触发 0x80 号软中断，跳转到内核的系统调用入口；|
+|: "=a"(__res)| 输出约束：`"=a" 表示将 %eax 寄存器的值写入变量 __res`（`a 对应 %eax，= 表示只写`）；|
+|: "0"(2)|      输入约束："0" 表示`复用第一个输出约束的寄存器`（即 `%eax`），将数值 2 `写入 %eax`；|
+
+```c
+if (__res >= 0) return (int)__res;
+```
+- 内核返回的 `__res >= 0` 表示`系统调用成功`：
+- 父进程中，__res 是`子进程的 PID（正数）`；
+- 子进程中，__res 是 0（这是 fork 的特性：`一次调用，两次返回`；
+- 将 long 型的 __res 强转为 int 并返回（`PID 是整型`）。
+
+//保持疑问？父子进程是怎么体现两次返回的？
+
+====
+```c
+errno = -__res;
+```
+- 若 __res < 0，表示`系统调用失败`：内核返回的是`负数错误码`（比如 `-EAGAIN` 表示资源不足）；
+- 将 __res 取反后赋值给 `errno`（errno 是`全局变量`，存储`用户态可识别的错误码`，比如 -(-EAGAIN) = EAGAIN）。
+
+===
+```c
+return -1;
+```
+**系统调用失败时，返回 -1**（这是 fork 函数的约定：**失败返回 -1，成功返回子进程 PID/0**）。
+

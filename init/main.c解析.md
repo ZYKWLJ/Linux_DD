@@ -905,7 +905,7 @@ sys_setreuid,sys_setregid, sys_iam, sys_whoami };
 
 而我们上述`系统调用(中断)引用`的函数的具体实现，都是分布在`各个不同的文件中的`。这里只是进行统一的描述。
 
-##### 6.1 sys_fork的实现
+##### 6.2 sys_fork的实现
 sys_fork的具体实现也是汇编写的。来剖析剖析。
 ```s
 .align 2
@@ -924,5 +924,129 @@ sys_fork:
 ```
 我们可以看到，这里具体是`find_empty_process`和`copy_process`两个函数。
 
-##### 6.1.1 find_empty_process的实现
+###### 6.2.1 find_empty_process的实现
+
+> 背景知识：Linux 采用了**进程槽位**的概念，每个进程都有一个唯一的进程槽位，用于存储进程的信息。当一个进程创建时，Linux 会遍历进程槽位，找到一个空闲的槽位，将新进程的信息存储在该槽位中。
+
+```c
+int find_empty_process(void)
+{
+	int i;
+    //计算出最小的未使用的pid
+	repeat:
+		if ((++last_pid)<0) last_pid=1;
+		for(i=0 ; i<NR_TASKS ; i++)
+			if (task[i] && task[i]->pid == last_pid) goto repeat;//每次遍历一个pid，就遍历所有的进程，看看该pid是否被使用了。
+    //找到空闲的进程槽位
+	for(i=1 ; i<NR_TASKS ; i++)
+		if (!task[i])
+			return i;//最后返回进程槽位。[注意此时的pid和槽位毫无关系。独立的。]
+	return -EAGAIN;
+}
 ```
+
+> 核心逻辑：这里是先找出未使用的最小的pid，再找出未使用的第一个空闲的进程槽位，返回进程槽位的索引。最后返回槽位。
+
+###### 6.2.2 copy_process的实现
+顾名思义，这就是复制进程的信息。所以，`在Linux中，创建新进程的逻辑就是复制母进程的信息`。
+`有哪些具体的信息呢？直接看源码！`
+
+>注意，这是fork的核心实现，显然，fork和copy同一意，所以，要特别理清这个函数。
+
+```c
+int copy_process(int nr,long ebp,long edi,long esi,long gs,long none,
+		long ebx,long ecx,long edx,
+		long fs,long es,long ds,
+		long eip,long cs,long eflags,long esp,long ss)
+    // 这里的参数有讲究：
+    // 1、系统调用入口保存的：eip, cs, eflags, esp, ss（系统调用发生时自动压栈）
+    // 2、sys_fork汇编代码push的：eax, ebp, edi, esi, gs
+    // 3、系统调用入口push的：ebx, ecx, edx, fs, es, ds
+{
+	struct task_struct *p;
+	int i;
+	struct file *f;
+
+	p = (struct task_struct *) get_free_page(); //分配4KB内存页作为任务结构体(这个就是进程的结构体，后详述)
+	if (!p)
+		return -EAGAIN; //这个是errno的错误码。意思为：没有空闲的进程槽位了。
+	task[nr] = p;       //将新进程指针放入全局进程表
+	
+	// NOTE!: the following statement now work with gcc 4.3.2 now, and you
+	// must compile _THIS_ memcpy without no -O of gcc.#ifndef GCC4_3
+
+	*p = *current;	/* NOTE! this doesn't copy the supervisor stack */
+    // 这里只复制了task_struct结构体，没有复制内核栈(即栈指针esp)。每个进程都有自己的内核栈。
+    // 这里的内核栈如何体现的？不明白。
+
+    // 这里开始初始化新进程属性
+    p->state = TASK_UNINTERRUPTIBLE;  // 进程先设为不可中断状态
+    p->pid = last_pid;                // 分配新PID(刚刚在find_empty_process中计算的)
+    p->father = current->pid;         // 设置父进程PID
+    p->counter = p->priority;         // 时间片计数器
+    p->signal = 0;                    // 清除信号
+    p->alarm = 0;                     // 清除闹钟
+    p->leader = 0;                    // 不继承会话领导权
+    p->utime = p->stime = 0;          // 清空用户/系统态时间
+    p->cutime = p->cstime = 0;        // 清空子进程时间统计
+    p->start_time = jiffies;          // 设置启动时间
+
+    // 这里开始设置新进程的TSS，即任务状态段！
+	p->tss.back_link = 0;
+	p->tss.esp0 = PAGE_SIZE + (long) p;
+	p->tss.ss0 = 0x10;
+	p->tss.eip = eip;
+	p->tss.eflags = eflags;
+	p->tss.eax = 0;
+	p->tss.ecx = ecx;
+	p->tss.edx = edx;
+	p->tss.ebx = ebx;
+	p->tss.esp = esp;
+	p->tss.ebp = ebp;
+	p->tss.esi = esi;
+	p->tss.edi = edi;
+	p->tss.es = es & 0xffff;
+	p->tss.cs = cs & 0xffff;
+	p->tss.ss = ss & 0xffff;
+	p->tss.ds = ds & 0xffff;
+	p->tss.fs = fs & 0xffff;
+	p->tss.gs = gs & 0xffff;
+	p->tss.ldt = _LDT(nr);
+	p->tss.trace_bitmap = 0x80000000;
+
+    // 这里开始做浮点协处理器状态初始化
+	if (last_task_used_math == current)
+		__asm__("clts ; fnsave %0"::"m" (p->tss.i387));
+
+    //这里开始复制内存空间，即，copy_mem()：复制页表，实现写时复制（Copy-on-Write）
+	if (copy_mem(nr,p)) {
+		task[nr] = NULL;
+		free_page((long) p);
+		return -EAGAIN;
+	}
+
+    //这里复制文件描述符引用计数，增加所有打开文件、工作目录、根目录、可执行文件的引用计数。
+	for (i=0; i<NR_OPEN;i++)
+		if ((f=p->filp[i]))//这里太牛逼了，用错误的语法，写正确的逻辑。先赋值指针，然后判断如果该文件描述符指针不为空，就增加引用计数。所以看似错了，实际上，大有妙处。
+			f->f_count++;//如果文件描述符指针不为空，就增加引用计数。
+            //这里看似f是一个局部变量，但是他和我们当前的进程指向一致，也确确实实改变了当前进程的文件描述符引用计数。
+	if (current->pwd)   //进程当前工作目录的 inode 指针
+		current->pwd->i_count++;
+	if (current->root)  //进程根目录的 inode 指针
+		current->root->i_count++;
+	if (current->executable)    //进程可执行文件的 inode 指针
+		current->executable->i_count++;
+
+    //这里开始设置GDT描述符，在全局描述符表(GDT)中设置新进程的TSS和LDT描述符。
+    //这里就又涉及到set_tss_desc、set_ldt_desc的细节了，接下来会详细讲解。
+	set_tss_desc(gdt+(nr<<1)+FIRST_TSS_ENTRY,&(p->tss));
+	set_ldt_desc(gdt+(nr<<1)+FIRST_LDT_ENTRY,&(p->ldt));
+	p->state = TASK_RUNNING;	/* do this last, just in case */
+	return last_pid;    //返回进程的PID
+}
+```
+
+##### 6.3 set_tss_desc详细实现
+
+
+##### 6.4 set_ldt_desc详细实现

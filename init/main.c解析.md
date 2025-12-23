@@ -190,7 +190,7 @@ int main(void) {
 
 
 ## (三)系统调用精讲
-### 1.fork调用详细转化
+### 1.fork调用详细宏转化
 详细讲解这句话：
 ```c
 static inline _syscall0(int,fork)
@@ -218,12 +218,7 @@ linus对于系统调用的实现如下：
 
 所以调用了这个`_syscall0(int,fork)`函数，会生成：如下.i文件：
 ```c
-# 1 ".\\linus_fork.c"
-# 1 "<built-in>"
-# 1 "<command-line>"
-# 1 ".\\linus_fork.c"
 int errno = 0;
-# 15 ".\\linus_fork.c"
 static inline int fork(void)
 {
     long __res;
@@ -582,3 +577,352 @@ __asm__ (
 那么具体的逻辑就到了fork的实现：
 首先，我们的系统调用功能功能号是__NR_##name，对应在这里，就是__NR_fork，就是2。
 2，将是系统调用表的索引，我们会调用这个索引处的函数：
+
+#### 4.中断描述符设置好了，那么具体的中断处理函数sys_fork是什么呢？
+前面，我们详细讲述了中断处理函数的前置处理流程：设置中断描述符。现在我们来看看具体的中断处理函数sys_fork。这是理解fork的关键。
+
+首先，调用`_syscall0(int,fork)`函数，该宏会转化为如下：
+```c
+int errno = 0;
+static inline int fork(void)
+{
+    long __res;
+    __asm__ volatile(
+        "int $0x80"     //调用中断号为0x80,说明进入系统调用
+        : "=a"(__res)   //这里用于存储系统调用的返回值(也就是系统调用的功能号(2对应的系统中断就是fork))
+        : "0"(2)        //"0"对应的是第一个绑定寄存器：'=a',即eax，将系统中断的功能号2,传入eax寄存器
+    );
+    if (__res >= 0)     //这里会使用前面的系统调用结果，判断系统调用是否成功
+        return (int)__res;
+    errno = -__res;
+    return -1;
+}
+```
+那么，`int $0x80`触发中断后，CPU会跳转到中断描述符表的0x80号处来找到中断处理函数：
+```c
+set_system_gate(0x80, &system_call); 
+```
+显然，我们的系统调用中断处理函数为`system_call`。那么system_call的具体实现是什么呢？
+我们继续剖析：
+
+#### 5.system_call的实现
+在![../kernel/sched.c](../kernel/sched.c)中，有一个system_call的外部引用
+```c
+extern void system_call(void);
+```
+那说明，system_call在其他文件中实现，我们继续查找。
+这里就直接给出结论了：system_call在![../kernel/system_call.s](../kernel/system_call.s)中实现。
+> 可以看到，系统调用是如此重要！直接单独给他设置了一个文件！
+
+来看看其中重要的代码：
+```s
+nr_system_calls = 74 # 说明了，系统调用一共有74个！
+.globl system_call,sys_fork,timer_interrupt,sys_execve # 定义了系统调用的全局变量
+
+system_call:
+	cmpl $nr_system_calls-1,%eax
+	ja bad_sys_call
+	push %ds
+	push %es
+	push %fs
+	pushl %edx
+	pushl %ecx		# push %ebx,%ecx,%edx as parameters
+	pushl %ebx		# to the system call
+	movl $0x10,%edx		# set up ds,es to kernel space
+	mov %dx,%ds
+	mov %dx,%es
+	movl $0x17,%edx		# fs points to local data space
+	mov %dx,%fs
+	call *sys_call_table(,%eax,4)
+	pushl %eax
+	movl current,%eax
+	cmpl $0,state(%eax)		# state
+	jne reschedule
+	cmpl $0,counter(%eax)		# counter
+	je reschedule
+ret_from_sys_call:
+	movl current,%eax		# task[0] cannot have signals
+	cmpl task,%eax
+	je 3f
+	cmpw $0x0f,CS(%esp)		# was old code segment supervisor ?
+	jne 3f
+	cmpw $0x17,OLDSS(%esp)		# was stack segment = 0x17 ?
+	jne 3f
+	movl signal(%eax),%ebx
+	movl blocked(%eax),%ecx
+	notl %ecx
+	andl %ebx,%ecx
+	bsfl %ecx,%ecx
+	je 3f
+	btrl %ecx,%ebx
+	movl %ebx,signal(%eax)
+	incl %ecx
+	pushl %ecx
+	call do_signal
+	popl %eax
+3:	popl %eax
+	popl %ebx
+	popl %ecx
+	popl %edx
+	pop %fs
+	pop %es
+	pop %ds
+	iret
+
+.align 2
+sys_fork:
+	call find_empty_process
+	testl %eax,%eax
+	js 1f
+	push %gs
+	pushl %esi
+	pushl %edi
+	pushl %ebp
+	pushl %eax
+	call copy_process
+	addl $20,%esp
+1:	ret
+```
+从这里我们看到，主要是讲解`system_call`、`sys_fork`的实现。
+
+我们挨个讲解：
+##### 5.1 system_call的实现
+```s
+system_call:
+	cmpl $nr_system_calls-1,%eax     # 比较系统调用号是否超过了总的系统调用数，这说明我们一定存在一个数组的结构，里面存放着所有的系统调用。提供索引访问具体的系统调用的形式。
+	ja bad_sys_call # 如果eax里面的传参大于了总的系统调用号，说明我们调用的系统调用不存在，直接跳转bad_sys_call，下面紧接着就会讲解bad_sys_call的实现。本质就是直接诶返回-1
+	push %ds    # 从这里开始就是系统调用成功了，我们需要做执行系统调用的前置工作：保存上下文。
+	push %es
+	push %fs
+	pushl %edx
+	pushl %ecx		# push %ebx,%ecx,%edx as parameters
+	pushl %ebx		# to the system call
+# 内核态
+	movl $0x10,%edx        
+# 0x10 是内核数据段的选择子（GDT中定义），0001 0000 由段选择子的结构可以得知其作用
+# ┌─────────────────────────────────────┐
+# │     15~3 索引     │ 2：TI │ 1~0：RPL │
+# └─────────────────────────────────────┘
+# RPL：取值一共4种，分别是0、1、2、3。越低，权限越高。
+# TI：TI为0时，从 GDT（全局描述符表）中查找(绝大多数情况)，TI为1时，从 LDT（局部描述符表）中查找。
+
+# 显然，这里的索引是0001 0，为2，那么就是内核数据段！
+    mov %dx,%ds           # 把ds设置为内核数据段
+    mov %dx,%es           # 把es设置为内核数据段
+
+# 用户态：
+    movl $0x17,%edx        
+# 0x17 是用户数据段的选择子（供fs使用），0001 0111 由段选择子的结构可以得知其作用
+# 显然，DPL=3，也就是用户态数据，并且TI为1，说明从LDT中访问！至于索引，依然是0001 0，为2，用户数据段！
+    mov %dx,%fs           # fs指向用户数据段（内核态访问用户数据时用）
+
+	call *sys_call_table(,%eax,4) # 调用系统调用表中的系统调用，eax中存放的是系统调用号，根据系统调用号，找到对应的系统调用函数。
+#  函数指针的寻址方式： (基址寄存器, 索引寄存器, 比例)
+#  sys_call_table 是内核定义的函数指针数组（每个元素是内核函数的地址，占 4 字节）。
+#  目标函数地址 = sys_call_table + %eax × 4
+
+	pushl %eax  #  保存系统调用的返回值（比如fork返回的PID/0）
+	movl current,%eax   # current指向当前进程（父进程）的task_struct
+	cmpl $0,state(%eax)		# 检查进程状态：state=0 → 就绪，非0 → 需调度
+
+#TASK_RUNNING           0
+#TASK_INTERRUPTIBLE	    1
+#TASK_UNINTERRUPTIBLE	2
+#TASK_ZOMBIE		    3
+#TASK_STOPPED		    4
+
+	jne reschedule      # 状态非0，说明自身还在运行。跳转到reschedule（进程调度）
+	cmpl $0,counter(%eax)		# 检查进程时间片：counter=0 → 说明自身时间片用完了，进行调度
+	je reschedule       # 时间片用完，跳转到reschedule
+```
+
+##### 5.2bad_sys_call的实现
+```s
+.align 2
+bad_sys_call:
+	movl $-1,%eax # 显然，直接返回-1，说明系统调用失败。
+	iret
+```
+
+##### 5.3reschedule的实现
+```s
+.align 2
+reschedule:
+	pushl $ret_from_sys_call
+	jmp schedule
+```
+
+##### 5.4ret_from_sys_call的实现
+这里是系统调用返回核心逻辑。
+主要是进行系统调用返回前`处理待处理信号`（Linux 信号机制的核心入口）；
+本质上就是进行一系列检查，看是不是信号处理的时机，是的话，才处理信号。
+```s
+ret_from_sys_call:
+#检查当前进程是否是任务0（内核空闲任务），如果是任务0，直接跳转到3:标签（即不处理信号）
+    movl current,%eax     # 重新获取当前进程到eax（可能被调度过）
+    cmpl task,%eax        # 检查是否是idle进程（task[0]）,这里是sched.c里面的全局变量
+    je 3f                 # 是idle进程，跳过信号处理（idle无信号），直接恢复现场。
+# https://chat.deepseek.com/share/e0pykx7uqsa049jt79
+
+# 检查是否从内核态返回到用户态，只有在从内核态返回到用户态时才处理信号
+# 检查原代码段选择符是否为0x0f（用户态代码段）
+    cmpw $0x0f,CS(%esp)   # 检查旧代码段（CS）是否是用户态（0x0f=内核代码段） 因为0000 1111,这就是用户态代码段。
+# CS = 0x20,这里CS(%esp) = 内核栈基址（% esp） + CS 偏移量 → 取出这个地址里的 16 位值（就是之前保存的旧CS值）。
+    jne 3f                # 不是用户态，跳过（只处理用户态返回的信号），直接返回恢复现场的动作pop一系列。
+
+# 检查原堆栈段选择符是否为0x17（用户态堆栈段）
+    cmpw $0x17,OLDSS(%esp)# 检查旧栈段（SS）是否是用户数据段（0x17） 因为0001 0111,这就是用户态代码段。
+# OLDSS	= 0x2C
+    jne 3f                # 不是，跳过（只处理用户态返回的信号）
+
+#检查是否有未阻塞的信号
+    movl signal(%eax),%ebx    # 取出当前进程的待处理信号集
+    movl blocked(%eax),%ecx   # 取出当前进程的阻塞信号集
+    notl %ecx                 # 阻塞信号集取反（非阻塞的信号）
+    andl %ebx,%ecx            # 计算：待处理 & 非阻塞 → 真正要处理的信号
+    bsfl %ecx,%ecx            # 找第一个要处理的信号（最低位的1）
+    je 3f                     # 无信号，跳转到3f
+
+# 清除该信号位并调用该信号处理函数
+    btrl %ecx,%ebx            # 清除已处理的信号位
+    movl %ebx,signal(%eax)    # 更新进程的信号集
+    incl %ecx                 # 信号编号从1开始（bsfl返回0表示第1位）
+    pushl %ecx                # 信号编号入栈，作为do_signal的参数
+    call do_signal            # 处理信号（调用信号处理函数）
+    popl %eax                 # 弹出信号编号，恢复栈
+```
+
+##### 5.5恢复现场，iret返回用户态
+这里显然，是和之前入栈的顺序刚刚相反，这里命名上写的都是自己的压栈的寄存器，不是CPU硬件层面的行为，CPU硬件层面的行为通过`iret一个指令`实现了。
+```s
+3:  popl %eax         # 弹出系统调用的返回值（之前pushl %eax）
+    popl %ebx         # 恢复%ebx
+    popl %ecx         # 恢复%ecx
+    popl %edx         # 恢复%edx
+    pop %fs           # 恢复%fs
+    pop %es           # 恢复%es
+    pop %ds           # 恢复%ds
+    iret              # 中断返回：恢复用户态（CS/IP/EFLAGS/SS/ESP）
+
+这是之前压栈的顺序：
+#  * Stack layout in 'ret_from_system_call':
+#  *
+#  *	 0(%esp) - %oldeax
+#  *	 4(%esp) - %oldebx
+#  *	 8(%esp) - %oldecx
+#  *	 C(%esp) - %oldedx
+#  *	10(%esp) - %oldfs
+#  *	14(%esp) - %oldes
+#  *	18(%esp) - %oldds
+#  *	1C(%esp) - %oldeip      # 从这里往下数的5个寄存器都是CPU硬件层面的行为，中断就必须会执行，往上的7个，是自己实现。 
+#  *	20(%esp) - %oldcs
+#  *	24(%esp) - %oldeflags   # 注意这里linus从这里往上就没有old前缀了，是不正确的，这里理应是old，因为是之前的。
+#  *	28(%esp) - %oldesp
+#  *	2C(%esp) - %oldss
+```
+
+##### 5.6为啥通过CS(%esp)就可以判断是否是内核态？(堆栈布局怎么来的？)
+就上面的这段代码
+```s
+    cmpw $0x0f,CS(%esp)   # 检查旧代码段（CS）是否是内核态（0x0f=内核代码段）
+```
+等价于`CS+CS偏移量`
+在![../kernel/system_call.s](../kernel/system_call.s)开头，也有相关堆栈布局的论述：
+```s
+ * Stack layout in 'ret_from_system_call':
+ *
+ *	 0(%esp) - %oldeax
+ *	 4(%esp) - %oldebx
+ *	 8(%esp) - %oldecx
+ *	 C(%esp) - %oldedx
+ *	10(%esp) - %oldfs
+ *	14(%esp) - %oldes
+ *	18(%esp) - %oldds
+ *	1C(%esp) - %oldeip      # 从这里往下数的5个寄存器都是CPU硬件层面的行为，中断就必须会执行，往上的7个，是自己实现。 
+ *	20(%esp) - %oldcs
+ *	24(%esp) - %oldeflags   # 注意这里linus从这里往上就没有old前缀了，是不正确的，这里理应是old，因为是之前的。
+ *	28(%esp) - %oldesp
+ *	2C(%esp) - %oldss
+
+# 其实梳理下来，就是CPU会自动保存旧的堆栈系统、标志寄存器、代码寻址系统。
+# 并且需要我们自己保存的是：%eax、%ebx、%ecx、%edx、%fs、%es、%ds。
+```
+怎么来的？
+
+> 核心答案是：这是 CPU 执行int $0x80软中断时，**硬件级别的自动行为** ——CPU 会把**触发中断前的 CS 值（旧 CS）**压入内核栈，**内核只是按固定栈布局去读取这个值。**
+
+然后我们也需要自己保存%eax、%ebx、%ecx、%edx、%fs、%es、%ds。
+
+#### 6.sys_fork的实现
+说了这么多，都是说的系统调用的总流程 ，还没有来到我们的sys_fork的实现，我们来看看我们的核心目标，sys_fork的实现。
+
+刚刚说了：
+```s
+call *sys_call_table(,%eax,4) # 这里会调用我们的对应索引处的中断函数，那么，显然，之前fork中断存在eax里面的，是多少？回顾一下：
+```
+这里显然，是2，因为fork的中断号是2。
+```c
+int errno = 0;
+static inline int fork(void)
+{
+    long __res;
+    __asm__ volatile("int $0x80" : "=a"(__res) : "0"(2)); //具体是这里，"0"(2)复用了eax，写入2，所以，eax里面就是2。
+    if (__res >= 0)
+        return (int)__res;
+    errno = -__res;
+    return -1;
+}
+```
+好了，那么我们肯定会找到sys_call_table的2号索引，也就是sys_fork的实现。
+
+那么我们来看看sys_call_table的实现先。
+##### 6.1 sys_call_table的实现
+在![../include/linux/sys.h](../include/linux/sys.h)中，有sys_call_table的实现：
+```c
+//这是在include/linux/sched.h中定义的函数指针
+typedef int (*fn_ptr)();
+//这里是在include/linux/sys.h中引用的sys_call_table中的函数
+extern int sys_setup();
+extern int sys_exit();
+extern int sys_fork();
+//......还有很多一直引用完全,具体实现，都是分布在`各个不同的文件中的`。
+
+//这是在include/linux/sys.h中定义的sys_call_table
+fn_ptr sys_call_table[] = { sys_setup, sys_exit, sys_fork, sys_read,
+sys_write, sys_open, sys_close, sys_waitpid, sys_creat, sys_link,
+sys_unlink, sys_execve, sys_chdir, sys_time, sys_mknod, sys_chmod,
+sys_chown, sys_break, sys_stat, sys_lseek, sys_getpid, sys_mount,
+sys_umount, sys_setuid, sys_getuid, sys_stime, sys_ptrace, sys_alarm,
+sys_fstat, sys_pause, sys_utime, sys_stty, sys_gtty, sys_access,
+sys_nice, sys_ftime, sys_sync, sys_kill, sys_rename, sys_mkdir,
+sys_rmdir, sys_dup, sys_pipe, sys_times, sys_prof, sys_brk, sys_setgid,
+sys_getgid, sys_signal, sys_geteuid, sys_getegid, sys_acct, sys_phys,
+sys_lock, sys_ioctl, sys_fcntl, sys_mpx, sys_setpgid, sys_ulimit,
+sys_uname, sys_umask, sys_chroot, sys_ustat, sys_dup2, sys_getppid,
+sys_getpgrp, sys_setsid, sys_sigaction, sys_sgetmask, sys_ssetmask,
+sys_setreuid,sys_setregid, sys_iam, sys_whoami };
+```
+
+而我们上述`系统调用(中断)引用`的函数的具体实现，都是分布在`各个不同的文件中的`。这里只是进行统一的描述。
+
+##### 6.1 sys_fork的实现
+sys_fork的具体实现也是汇编写的。来剖析剖析。
+```s
+.align 2
+sys_fork:
+	call find_empty_process # 调用C函数，寻找空闲的进程槽位
+	testl %eax,%eax # 测试返回值（eax存放返回值）
+	js 1f    # 如果返回值是负数（符号位为1），跳转到标签1（失败返回）
+	push %gs    # 保存各个寄存器 (进行上下文切换的前兆)，这里也是下面copy_process的参数(部分参数)。
+	pushl %esi  
+	pushl %edi
+	pushl %ebp
+	pushl %eax
+	call copy_process # 调用C函数，复制当前进程
+	addl $20,%esp   # 清理栈（5个寄存器参数×4字节=20字节），防止栈不平衡。
+1:	ret # 返回（1:标签，失败和成功都会到这里）
+```
+我们可以看到，这里具体是`find_empty_process`和`copy_process`两个函数。
+
+##### 6.1.1 find_empty_process的实现
+```

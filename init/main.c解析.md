@@ -640,6 +640,7 @@ system_call:
 	jne reschedule
 	cmpl $0,counter(%eax)		# counter
 	je reschedule
+
 ret_from_sys_call:
 	movl current,%eax		# task[0] cannot have signals
 	cmpl task,%eax
@@ -1271,3 +1272,166 @@ LDT（局部描述符表）：好比每个员工的私人通讯录，只自己�
      * 作用：通过 LDT 实现“进程地址空间隔离”——每个进程的 LDT 不同，确保进程只能访问自己的内存段。
      */
 ```
+
+## (四)进程调度精讲
+我们在前面的系统调用中，有这一个调用`reschedule`：
+```s
+system_call:
+	cmpl $nr_system_calls-1,%eax
+	ja bad_sys_call
+	push %ds
+	push %es
+	push %fs
+	pushl %edx
+	pushl %ecx		# push %ebx,%ecx,%edx as parameters
+	pushl %ebx		# to the system call
+	movl $0x10,%edx		# set up ds,es to kernel space
+	mov %dx,%ds
+	mov %dx,%es
+	movl $0x17,%edx		# fs points to local data space
+	mov %dx,%fs
+	call *sys_call_table(,%eax,4)
+	pushl %eax
+	movl current,%eax
+	cmpl $0,state(%eax)		# state
+	jne reschedule
+	cmpl $0,counter(%eax)		# counter
+	je reschedule
+```
+显然，这个就是进程调度的函数。那么我们深入讲解之。
+reschedule的实现如下：
+```s
+.align 2
+reschedule:
+	pushl $ret_from_sys_call
+	jmp schedule
+```
+所以重点在`schedule`函数。
+
+### 1. schedule函数的实现
+函数出处：![kernel/sched.c](../kernel/sched.c)
+
+linus的原注释如下，可见他给予这段代码高度的评价!：
+```c
+/*
+ *  'schedule()' 是调度器核心函数。这是一段健壮的优质代码！
+ * 通常无需对其做任何修改，因为它在所有场景下都能稳定工作
+ *（例如为IO密集型进程提供良好的响应性等）。
+ * 唯一可能需要关注的地方是此处的信号处理程序代码。
+ *
+ *   注意！0号任务是“空闲”任务，仅当无其他任务可运行时才会被调用。
+ * 该任务无法被终止，也不能进入睡眠状态。task[0]中的“状态”
+ * 字段信息永远不会被使用。
+ */
+```
+具体如下：
+```c
+void schedule(void)
+{
+    int i, next, c; // next：选中的下一个要运行的任务ID，c：当前找到的最大counter值，p：任务结构体指针的指针（二级指针）
+    struct task_struct **p; // p：任务结构体指针的指针（二级指针），用于遍历任务队列，可以持久化更改结构体指针的内容，当然，指针地址变了，该结构体指向也就可能变了。
+
+//第一部分：信号和唤醒处理
+//"检查定时器（alarm），唤醒所有已收到信号的可中断任务"
+    
+    for (p = &LAST_TASK; p > &FIRST_TASK; --p) // 从LAST_TASK到FIRST_TASK反向遍历所有任务（任务0是空闲任务）
+        if (*p) // 检查任务槽是否被占用（不为NULL）,只有被占用了，才会继续
+        {
+            if ((*p)->alarm && (*p)->alarm < jiffies) // 定时器检查，如果任务设置了alarm且alarm时间已到（jiffies是系统时钟滴答计数）
+            {
+                (*p)->signal |= (1 << (SIGALRM - 1));// 给任务发送SIGALRM信号（信号位图中设置相应位）
+                (*p)->alarm = 0; // 清空alarm值
+            }
+            if (((*p)->signal & ~(_BLOCKABLE & (*p)->blocked)) &&
+                (*p)->state == TASK_INTERRUPTIBLE)// 如果任务有未阻塞的信号且处于可中断睡眠状态
+                (*p)->state = TASK_RUNNING;// 则将其状态改为就绪状态（TASK_RUNNING）
+        }
+
+//  第二部分：寻找合适任务
+// 调度，选出下一个任务。
+    while (1)
+    {
+        c = -1; //初始化最大counter (时间片)值为-1（确保任何正counter都能被选中）
+        next = 0;//默认选择任务0，怠速任务
+        i = NR_TASKS; //任务总数
+        p = &task[NR_TASKS]; // 指向最后一个任务的指针
+        while (--i) // 寻找counter最大的就绪任务
+        {
+            if (!*--p)//如果任务槽为空则跳过
+                continue;
+            if ((*p)->state == TASK_RUNNING && (*p)->counter > c)// 如果任务处于就绪状态且其counter大于当前最大值c
+                c = (*p)->counter, next = i;// 更新最大counter值c和下一个要运行的任务ID next
+        }//如此，当遍历完所有任务后，next就指向了counter最大的就绪任务（如果有）
+        if (c)// 如果找到一个就绪任务（c大于-1）
+            break;// 唯一退出的条件。
+        //如果遍历完上述的，所有就绪任务的counter都为0，继续下面的时间片重新分配
+        for (p = &LAST_TASK; p > &FIRST_TASK; --p)
+            if (*p)
+                (*p)->counter = ((*p)->counter >> 1) +
+                                (*p)->priority;//经典的优先级衰减+补偿算法,重新分配时间片,实现了动态优先级和公平调度
+    }
+
+// 第三部分：任务切换
+    switch_to(next);
+    // 切换到选中的下一个任务（next），这是最核心的最底层的切换操作。总的来说，就是
+    // 1. 保存当前任务上下文，恢复下一个任务的上下文
+    // 2. 通过TSS（任务状态段）和硬件任务切换实现的
+}
+```
+下面，自然要来讲解上下文切换的终极boss：`switch_to`.
+
+### 2. switch_to函数的实现
+
+switch_to依然是定义在![../include/linux/sched.h](../include/linux/sched.h)中的宏：
+> 总功能：定义宏switch_to(n)，n是要切换到的任务号
+```c
+#define switch_to(n)                                 \ 
+    {                                                \ 
+        struct                                       \
+        {                                            \
+            long a/*偏移*/, b/*段选择子*/;            \ //存储欲切换到的目的进程远跳转的地址（段选择子+偏移）
+        } __tmp;                                     \  
+        __asm__("cmpl %%ecx,current\n\t"             \//比较`ecx寄存器`和`current变量`,前者保存着欲切换的目的进程task[n]的地址，后者是当前源任务指针
+                "je 1f\n\t"                          \//这里是为了避免自己和自己切换，如果是自己，立马跳到下面的1f标签处，
+                "movw %%dx,%1\n\t"                   \//移动指令：将dx的值移动到`%1`,即__tmp.b, dx寄存器保存着`_TSS(n)`（新任务的TSS段选择子）,在构建`远跳转描述符（TSS选择子+偏移）`
+                "xchgl %%ecx,current\n\t"            \//交换指令：交换`ecx`和`current(存着原任务的指针)`的值, current = 新任务指针，ecx = 原任务指针
+                "ljmp *%0\n\t"                       \//远跳转指令：长跳转到%0指向的地址，%0对应`__tmp.a`（临时结构的第一个long），*%0表示`间接寻址`，从`__tmp.a读取跳转目标`。这是关键的任务切换指令，会`触发CPU的上下文切换`。因为已经跑到目的段选择子对应的偏移上去了，开始重新运行目的任务的代码段了！
+
+                //进程切换主体在上面，下面就是协处理器的过程了。
+                "cmpl %%ecx,last_task_used_math\n\t" \//数学协处理器清理
+                "jne 1f\n\t"                         \//
+                "clts\n"                             \//
+                "1:"                                 \//标签1,
+                ::                                   \//
+                "m"(*&__tmp.a),                      \//%0，偏移
+                "m"(*&__tmp.b),                      \//%1，段选择子
+                "d"(_TSS(n)),                        \//%2,将目的任务n的TSS段选择子移动到edx寄存器
+                "c"((long)task[n]));                 \//%3,将目的任务n的指针移动到ecx寄存器
+    }
+```
+
+这里补充`_TSS宏`：
+
+依然是在：![../include/linux/sched.h](../include/linux/sched.h)中的宏：
+```c
+//说明了GDT表中的第四项就是TSS描述符
+#define FIRST_TSS_ENTRY 4   
+//计算得到的是任务n的TSS段选择子，这个TSS在之前的copy_process已经设置好了！现在直接取出来！
+#define _TSS(n) ((((unsigned long) n)<<4)+(FIRST_TSS_ENTRY<<3))
+//(((unsigned long) n)<<4)是指每一个TSS和LDT一起占用8字节，所以一起是16字节，每个TSS的选择子的离第一个TSS的偏移是*16的
+//(FIRST_TSS_ENTRY<<3)是指GDT表中第4项的偏移，每个描述符占用8字节(所以<<3)，所以第4项的偏移是32字节
+//两次偏移加在一起，即 ((((unsigned long) n)<<4)+(FIRST_TSS_ENTRY<<3))，就是我们的目的切换任务的地址了！
+```
+如图，第一个TSS和LDT的位置：
+
+![如图，第一个TSS和LDT的位置](image-8.png)
+
+
+
+
+
+
+
+
+
+

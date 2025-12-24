@@ -189,7 +189,7 @@ int main(void) {
 
 
 
-## (三)系统调用精讲
+## (三)系统调用精讲(以frok为例，详解fork)
 ### 1.fork调用详细宏转化
 详细讲解这句话：
 ```c
@@ -1046,7 +1046,228 @@ int copy_process(int nr,long ebp,long edi,long esi,long gs,long none,
 }
 ```
 
+这里最值得讲解的就是`set_tss_desc`和`set_ldt_desc`:
+>CPU不知道Linux的task_struct数据结构，它只知道：
+- TSS描述符：告诉CPU在哪里保存/恢复任务状态
+- LDT描述符：告诉CPU任务的私有内存描述符表在哪里
+- 没有这两个GDT条目，CPU无法切换到这个任务！
+
+所以，我们要设置TSS描述符和LDT描述符，才能让CPU切换到这个任务。
+
 ##### 6.3 set_tss_desc详细实现
+set_tss_desc源码实现：
+> 封装，实现了将GDT中的n号TSS描述符地址设置为addr(TSS结构体的地址)。
+```c
+/* 设置TSS描述符 */
+#define set_tss_desc(n, addr) \
+_set_tssldt_desc(((char *)(n)), ((int)(addr)), "0x89")
+```
+###### 6.3.1 tss结构体
+这里需要讲解TSS的结构体：
+> tss,全称：`task state segment` `任务状态字` ，是`保存和恢复上下文的`。这里是各个寄存器的值。
+> tss结构体：
+```c
+//这个结构体一共有26项int，大小为4*26=104B
+struct tss_struct {
+    int back_link;
+    int esp0;
+    int ss0;
+    int esp1;
+    int ss1;
+    int esp2;
+    int ss2;
+    int cr3;
+    int eip;
+    int eflags;
+    int eax;
+    int ecx;
+    int edx;
+    int ebx;
+    int esp;
+    int ebp;
+    int esi;
+    int edi;
+    int es;
+    int cs;
+    int ss;
+    int ds;
+    int fs;
+    int gs;
+    int ldt;
+    int trace_bitmap;
+};
+```
+可以看到，tss中，基本都是寄存器的值。
+
+###### 6.3.2 tss描述符
+就是存放的tss结构体的指针，指向tss结构体。
+![任务寄存器TR与局部描述符表寄存器LDTR](image-5.png)
+
+![TSS描述符结构](image-6.png)
+
+###### 6.3.3_set_tssldt_desc源码实现：
+这里的源码一定要看上面的TSS描述符结构。
+这里是直接将tss和idt一起共用这个函数了！
+
+```c
+/*
+ * 设置TSS或LDT描述符
+ * n: 描述符地址
+ * addr: TSS或LDT的基地址
+ * type: 描述符类型(0x89 for TSS, 0x82 for LDT)，这里很牛，通过一个标识符，简化代码
+ */
+#define _set_tssldt_desc(n, addr, type)              \
+    __asm__("movw $104,%1\n\t"                       /* 描述符的第1个字节起，TSS/LDT段限长为104字节这也是TSS结构体的大小 */ \
+            "movw %%ax,%2\n\t"                       /* 描述符的第3个字节起，将存放在ax里面TSS描述符的低16位地址在n中，即描述符地址中低16位中 */ \
+            "rorl $16,%%eax\n\t"                     /* 循环右移16位：EAX = [高16位][低16位] → [低16位][高16位]，将EAX中的基地址高16位移到低16位 */ \
+            "movb %%al,%3\n\t"                       /* 描述符的第5个字节起，存储TSS结构体地址的第24-16位到描述符的第5字节 */ \
+            "movb $" type ",%4\n\t"                  /* 描述符的第6个字节起，设置描述符类型 */ \
+            "movb $0x00,%5\n\t"                      /* 清除该字节(未使用) */ \
+            "movb %%ah,%6\n\t"                       /* 描述符的第8个字节起，存储基地址第31-24位 */ \
+            "rorl $16,%%eax"                         /* 恢复EAX原值：0x56781234 → 0x12345678*/
+             ::\
+            "a"(addr),              /* EAX = TSS/LDT基地址，即TSS结构体的地址，存入了EAX寄存器 */ \
+            "m"(*(n)),              /* "m"告诉编译器，这是一个内存地址，描述符的第1个字节 */ \
+            "m"(*(n + 2)),          /* 描述符的第3个字节 */ \
+            "m"(*(n + 4)),          /* 描述符的第5个字节 */ \
+            "m"(*(n + 5)),          /* 描述符的第6个字节 */ \
+            "m"(*(n + 6)),          /* 描述符的第7个字节 */ \
+            "m"(*(n + 7)))          /* 描述符的第8个字节 */ \
+```
+
+好了，TSS的具体调用是：
+```c
+_set_tssldt_desc(((char *)(n)), ((int)(addr)), "0x89")
+```
+那么0x89有何深意呢?
+> 0x89是TSS描述符的类型，0x82是LDT描述符的类型。`这就是规定的，少问为什么。`
 
 
 ##### 6.4 set_ldt_desc详细实现
+源码实现：
+```c
+/* 设置LDT描述符 */
+#define set_ldt_desc(n, addr) \
+_set_tssldt_desc(((char *)(n)), ((int)(addr)), "0x82")
+```
+
+###### 6.4.1. LDT描述符结构
+![LDT描述符结构](image-7.png)
+和上面一致.
+> 注意，在Linux0.11中，LDT没有像TSS一样，定义了具体的结构体，但是Linus在![../include/linux/head.h](../include/linux/head.h)里面定义了所有描述符的通用结构体：
+```c
+typedef struct desc_struct {
+	unsigned long a,b;
+} desc_table[256];
+```
+所以，我们的LDT肯定也是8字节的结构。
+
+##### 6.5再次回顾copy_process中的上下文设置
+> 我们在copy_process中，设置了TSS描述符和LDT描述符。
+
+```c
+set_tss_desc(gdt+(nr<<1)+FIRST_TSS_ENTRY,&(p->tss));
+set_ldt_desc(gdt+(nr<<1)+FIRST_LDT_ENTRY,&(p->ldt));
+```
+
+那么这里的`nr`是进程的编号，`FIRST_TSS_ENTRY`和`FIRST_LDT_ENTRY`是定义在![../include/linux/sched.h](../include/linux/sched.h)中的宏，分别是：
+
+```c
+#define FIRST_TSS_ENTRY 4   //说明了GDT表中的第四项就是TSS描述符
+#define FIRST_LDT_ENTRY (FIRST_TSS_ENTRY+1) // 说明了LDT描述符在GDT中的位置是TSS描述符的下一个，两者交替的。
+```
+![如图，第一个TSS和LDT的位置](image-8.png)
+
+这里的`(nr<<1)`是指进程的编号，每个进程都有一个TSS描述符和一个LDT描述符，所以，`(nr<<1)`就是进程的编号乘以2，得到的就是TSS描述符的位置。
+
+
+
+好了，到了这里，我们的上下文信息TSS和LDT就在GDT表中设置完成了。
+
+我们的进程的信息就copy完了。。
+
+那么，我们有没有想过，为什么需要在copy_process的过程中设置TSS和LDT描述符呢？
+
+##### 6.6为什么需要在copy_process的过程中设置TSS和LDT描述符呢？
+
+1. 核心原因：硬件要求
+x86 CPU不知道Linux的task_struct，`它只知道描述符表`：
+
+> 没有GDT中的TSS/LDT描述符，CPU无法识别这个任务！
+```c
+// Linux视角：
+struct task_struct *p = 分配内存();
+p->pid = 123;
+p->state = TASK_RUNNING;
+
+// CPU视角：
+TR寄存器 = 某个TSS选择子
+LDTR寄存器 = 某个LDT选择子
+```
+2. 任务生命周期的完整性
+创建任务必须完成的步骤：
+```c
+1. 分配内存 (get_free_page)
+   ↓
+2. 初始化数据结构 (*p = *current)
+   ↓
+3. 设置任务特定信息 (p->tss.eax = 0)
+   ↓
+4. ★★★ 注册到硬件 (set_tss_desc/set_ldt_desc) ← 关键！
+   ↓
+5. 加入调度队列 (task[nr] = p)
+   ↓
+6. 可以调度运行了
+```
+> 如果跳过第4步：调度器会选择这个任务，但switch_to()会失败，因为CPU找不到对应的TSS,即上下文丢失，自然无法进行上下文切换。
+
+
+3. Linux的创建即完整的哲学
+```c
+// 不好的设计：分步创建
+task_struct *create_task() { ... }
+void setup_tss(task_struct *p) { ... }  // 需要额外调用
+void setup_ldt(task_struct *p) { ... }  // 容易忘记！
+
+// Linux 0.11的设计：一次完成
+int copy_process(...) {
+    // 创建+初始化+注册 一气呵成
+    // 返回的任务已经是"可运行状态"
+}
+```
+
+
+##### 6.7 LDT 和 GDT的对比
+
+> LDT,局部描述符表，与GDT的对比如下：
+
+LDT详解：Local Descriptor Table（局部描述符表）
+LDT是x86保护模式中，`为每个任务（进程）提供的私有描述符表`，用于`定义任务专属的内存段。`
+
+类比理解：
+GDT（全局描述符表）：好比公司的公共通讯录，所有人都能用
+
+LDT（局部描述符表）：好比每个员工的私人通讯录，只自己使用
+
+核心区别：
+|特性	|GDT	|LDT|
+|-|-|-|
+|作用范围|**全系统共享**|**单个任务私有**|
+|数量|**系统一个**|**每个任务一个**|
+|内容|内核段、TSS、LDT描述符等|任务的代码段、数据段|
+|选择子TI位|TI=0|TI=1|
+
+> 补充一个从属关系：也就是LDT描述符包含在GDT中。
+但是LDT表，是独立的，位于![../include/linux/sched.h](../include/linux/sched.h)中
+```c
+ /* ldt for this task 0 - zero 1 - cs 2 - ds&ss（进程的局部描述符表，x86 架构内存保护核心） */
+    struct desc_struct ldt[3];
+    /*
+     * 背景：x86 架构中，LDT（局部描述符表）用于定义进程专属的内存段（与全局 GDT 区分）；
+     * 数组结构（3 个描述符，固定用途，不可修改）：
+     * - ldt[0]：空描述符（x86 要求 LDT 第一个描述符必须为 0，用于容错）；
+     * - ldt[1]：代码段描述符（CS 段寄存器指向该描述符，定义进程代码段的基地址、限长、权限）；
+     * - ldt[2]：数据段/栈段描述符（DS、SS 段寄存器指向该描述符，定义数据段/栈段的内存属性）；
+     * 作用：通过 LDT 实现“进程地址空间隔离”——每个进程的 LDT 不同，确保进程只能访问自己的内存段。
+     */
+```

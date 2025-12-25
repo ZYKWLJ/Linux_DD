@@ -1272,9 +1272,141 @@ LDT（局部描述符表）：好比每个员工的私人通讯录，只自己�
      * 作用：通过 LDT 实现“进程地址空间隔离”——每个进程的 LDT 不同，确保进程只能访问自己的内存段。
      */
 ```
+## (四)进程实现精讲
+我们在前面的系统调用中，有这一个调用`reschedule`，这是进行进程调度的函数。我们将会讲解调度。但是在讲解之前，先明确什么是进程，Linux中进程的实现。
 
-## (四)进程调度精讲
-我们在前面的系统调用中，有这一个调用`reschedule`：
+### 1.单个进程结构体源码
+在Linux中，进程是有`专门的结构体`： task_struct实现的。
+> 以前我们说的啥`进程是xxxxxx`,总是迷惑，但是现在有了源码，将不再迷惑。这就是`源码面前，没有迷惑`。
+```c
+struct task_struct {
+/* these are hardcoded - don't touch */
+	long state;	    /* -1 unrunnable, 0 runnable, >0 stopped */
+                    //进程状态：标记进程当前的运行状态，决定调度器是否可选择该进程
+	long counter;   //剩余时间片，实现时间片轮转调度的核心字段
+	long priority;  //优先级。优先级越高，初始时间片越长
+	long signal;    //未处理信号位图：标记进程收到但尚未处理的信号
+	struct sigaction sigaction[32];//信号处理动作数组：定义每个信号的“处理方式”
+	long blocked;	/* bitmap of masked signals */
+                    //阻塞信号掩码：标记当前“被阻塞”的信号（被阻塞的信号不会触发处理，暂存于 signal 中）
+
+/* various fields */
+	int exit_code;  //进程退出码：存储进程的终止状态，供父进程回收。
+                    //父进程通过 wait()/waitpid() 系统调用读取该值，判断子进程的终止原因。
+	unsigned long start_code,end_code,end_data,brk,start_stack;
+                    //进程内存区域边界：标记进程在内存中的代码段、数据段、栈段等关键地址，用于内存管理
+	long pid,father,pgrp,session,leader;
+                    //进程ID与亲属关系：``标识进程唯一``性及进程间的父子/组关系，用于进程管理
+	unsigned short uid,euid,suid;
+                    //用户身份标识：控制进程的文件访问权限、系统资源访问权限（Unix 安全模型核心）
+	unsigned short gid,egid,sgid;
+                    //用户组身份标识：控制进程的文件访问权限、系统资源访问权限（Unix 安全模型核心）
+	long alarm;     //闹钟定时器：记录进程设置的闹钟时间，用于实现 alarm() 系统调用
+	long utime,stime,cutime,cstime,start_time;
+                    //进程时间统计：记录进程的 CPU 使用时间，用于资源统计和调度优化
+	unsigned short used_math;
+                    //数学协处理器使用标记：标记进程是否使用 80387 数学协处理器（早期 x86 架构专用）
+
+/* file system info */
+	int tty;		            //进程关联的终端设备号：标记进程对应的终端（如控制台、串口）
+	unsigned short umask;       //文件创建掩码：控制新创建文件的默认权限（屏蔽指定的权限位）
+	struct m_inode * pwd;       //进程当前工作目录的 inode 指针：指向当前工作目录的索引节点（inode）
+	struct m_inode * root;      //进程根目录的 inode 指针：指向进程“根目录”的索引节点（默认是系统根目录 /）
+	struct m_inode * executable;//进程可执行文件的 inode 指针：指向当前进程运行的可执行文件的索引节点
+	unsigned long close_on_exec;//执行 exec() 时需关闭的文件掩码：标记进程中执行 exec() 系统调用后需自动关闭”的文件
+	struct file * filp[NR_OPEN];//文件描述符表：存储进程打开的文件的指针数组，是进程访问文件的核心接口
+
+/* ldt for this task 0 - zero 1 - cs 2 - ds&ss */
+	struct desc_struct ldt[3];  //进程的局部描述符表,
+    //  * 数组结构（3 个描述符，固定用途，不可修改）：
+    //  * - ldt[0]：空描述符（x86 要求 LDT 第一个描述符必须为 0，用于容错）；
+    //  * - ldt[1]：代码段描述符（CS 段寄存器指向该描述符，定义进程代码段的基地址、限长、权限）；
+    //  * - ldt[2]：数据段/栈段描述符（DS、SS 段寄存器指向该描述符，定义数据段/栈段的内存属性）；
+
+/* tss for this task */
+	struct tss_struct tss;      //进程的任务状态段，x86架构进程切换核心
+    //  * 核心逻辑：
+    //  * - 进程切换时，内核将当前进程的寄存器状态保存到其 TSS 中；
+    //  * - 加载新进程时，从其 TSS 中恢复寄存器状态，实现“上下文切换”；
+};
+```
+### 2.整个系统的进程数组
+```c
+#define NR_TASKS 64 /*系统支持的最大进程数*/
+extern struct task_struct *task[NR_TASKS];
+//这里主要是想告知，我们这里不是static，所以加上extern，虽说这是冗余的.....
+```
+>非extern即static这是一个好习惯，可以查看这个目录测试[test_static_extern](../test_static_extern/extern.c)
+可见，整个系统一共最多有64个进程。
+
+
+### 3.初识进程INIT_TASK
+这又是一个宏定义的。linus很喜欢用宏。
+```c
+/**/
+#define INIT_TASK                           \
+    /* state etc */ {                       \
+        0, /* 进程0一开始就运行哦，所以为0 */                         \
+            15,/*时间片为15ms*/                             \
+            15, /*优先级为15*/                            \
+            /* signals */ 0,  /*最开始也没收到什么信号，位图为0*/               \
+            {                               \
+                {},   /*定义每一个信号的处理方式，目前为0*/                      \
+            },                              \
+            0,      /*当期那被阻塞的信号为0，掩码位0了*/                        \
+            /* ec,brk... */ 0,/*代码段起地址*/              \
+            0,  /*代码段终地址*/                            \
+            0,  /*数据段终地址*/                            \
+            0,  /*堆栈指针*/                            \
+            0,   /**/                           \
+            0,   /**/                           \
+            /* pid etc.. */ 0,              \
+            -1,    /**/                         \
+            0,  /**/                            \
+            0,   /**/                           \
+            0,   /**/                           \
+            /* uid etc */ 0,                \
+            0,    /**/                          \
+            0,    /**/                          \
+            0,   /**/                           \
+            0,     /**/                         \
+            0,     /**/                         \
+            /* alarm */ 0,                  \
+            0,     /**/                         \
+            0,    /**/                          \
+            0,    /**/                          \
+            0,   /**/                           \
+            0,   /**/                           \
+            /* math */ 0,                   \
+            /* fs info */ -1,               \
+            0022,    /**/                       \
+            NULL,   /**/                        \
+            NULL,   /**/                        \
+            NULL,   /**/                        \
+            0,                              \
+            /* filp */ {                    \
+                NULL,    /**/                   \
+            },                              \
+            {                               \
+                {0, 0},   /**/                  \
+                /* ldt */ {0x9f, 0xc0fa00},/**/ \
+                {0x9f, 0xc0f200}, /**/          \
+            },                              \
+        /*tss*/ {                           \
+            0, PAGE_SIZE + (long)&init_task, 0x10,/**/\
+            0, 0, 0, 0, (long)&pg_dir, /**/     \
+            0, 0, 0, 0, 0, 0, 0, 0, 0,/**/  \
+            0, 0x17, 0x17, 0x17, 0x17,/**/  \
+            0x17, 0x17, _LDT(0),/**/    \
+            0x80000000, {}/**/      \
+}
+,
+}
+```
+
+
+## (五)进程调度精讲
+好了，我们讲完了进程的实现，现在可以专注讲解调度函数`reschedule`了：
 ```s
 system_call:
 	cmpl $nr_system_calls-1,%eax

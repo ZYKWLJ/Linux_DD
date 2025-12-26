@@ -1413,6 +1413,10 @@ extern struct task_struct *task[NR_TASKS];
 ,
 }
 ```
+另外为了指明当前正在运行的进程，linux采用了一个全局变量`current`，它指向当前正在运行的进程的任务结构体。
+```c
+extern struct task_struct *current;
+```
 
 
 ## (五)进程调度精讲
@@ -1569,3 +1573,392 @@ switch_to依然是定义在![../include/linux/sched.h](../include/linux/sched.h)
 ![如图，第一个TSS和LDT的位置](image-8.png)
 
 》=========2025年12月26日14:20:19再坚持坚持，终会成功的《===========
+
+## (六)继续讲解main.c剩下内容
+### 1._syscall0(int, pause) 
+
+好了，上面的所有，都源于main.c中的`static inline _syscall0(int, fork)`所引申出来的内容，这才是我们main函数的冰山一角呢！
+我们也说过，linux的所有内容都是基于main.c为主枝条的，搞明白它，就搞明白了linux，接下来，继续学习main.c的剩下内容吧！
+
+```c
+static inline _syscall0(int, pause) 
+```
+这里的pause是什么含义的函数呢？
+显然那，这是一个系统调用函数：
+具体的内容在![../kernel/sched.c](../kernel/sched.c)文件内:
+
+```c
+int sys_pause(void)
+{
+    current->state = TASK_INTERRUPTIBLE;
+    schedule();
+    return 0;
+}
+```
+>显然，这就是让我们的当前进程阻塞，然后重新调度进程。
+关于schedule()函数，我们在上面有了详细解释。
+
+
+### 2.printbuf[1024];
+这里是何含义？
+在我们的main.c中，定义了这样一段函数，并且使用了`printbuf`,没错！
+这就是我们常常使用的`printf`.
+```c
+static int printf(const char *fmt, ...)//const char *fmt: 第一个参数，格式化字符串（不可修改）、...: 可变参数列表，表示可以传入任意数量的参数
+{
+    va_list args;//定义一个可变参数列表变量，用于访问不定参数
+    int i;//用于存储返回值的临时变量
+
+    va_start(args, fmt);//初始化args，使其指向fmt之后第一个可变参数
+    write(1, printbuf, i = vsprintf(printbuf, fmt, args));//write系统调用，向文件描述符1中写入数据printbuf，写入的字节数为i
+    va_end(args);//清理工作，结束对可变参数的访问
+    return i;//返回写入的字节数
+}
+```
+> 这里的printbuf就是一个1024字节的缓冲区，用于存储格式化后的字符串，然后通过write系统调用将其写入到标准输出（文件描述符1）中。
+
+那么接下来就是我们的`va_start`、`write`、`vsprintf`、`va_end`函数的解释了。
+
+#### 2.1 va_start和va_end
+`va_start`和`va_end`是C语言中用于处理可变参数函数的宏，定义在头文件`<stdarg.h>` [../include/stdarg.h](../include/stdarg.h)中。
+
+```c
+#ifndef _STDARG_H
+#define _STDARG_H
+
+typedef char *va_list; //我们看到，va_list就仅仅是一个字符指针，用于指向可变参数列表的第一个参数
+
+/* Amount of space required in an argument list for an arg of type TYPE.
+   TYPE may alternatively be an expression whose type is used.  */
+
+#define __va_rounded_size(TYPE)  \
+  (((sizeof (TYPE) + sizeof (int) - 1) / sizeof (int)) * sizeof (int))
+
+#ifndef __sparc__
+
+#define va_start(AP, LASTARG) 						\
+ (AP = ((char *) &(LASTARG) + __va_rounded_size (LASTARG)))
+
+#else
+
+#define va_start(AP, LASTARG) 						\
+ (__builtin_saveregs (),						\
+  AP = ((char *) &(LASTARG) + __va_rounded_size (LASTARG)))
+
+#endif
+
+void va_end (va_list);		/* Defined in gnulib */
+
+#define va_end(AP)
+
+#define va_arg(AP, TYPE)						\
+ (AP += __va_rounded_size (TYPE),					\
+  *((TYPE *) (AP - __va_rounded_size (TYPE))))
+
+#endif /* _STDARG_H */
+```
+
+那么我们的`va_start`宏的作用就是将`AP`指针指向可变参数列表的第一个参数，即`LASTARG`之后的第一个参数。
+```c
+#define va_start(AP, LASTARG) 						\
+ (AP = ((char *) &(LASTARG) + __va_rounded_size (LASTARG)))
+```
+并且我们在printf中使用的是`va_start(args, fmt)`，将`args`指针指向`fmt`之后的第一个参数。也就是我们的第一个真正意义上的参数，何不美哉！
+这就是我们`第一个参数定基调，后几个参数定具体`的哲学体现！
+
+>即fmt定下参数有哪些，后面的参数就按照fmt的格式来定。
+
+当然，这里的`__va_rounded_size`实现：
+```c
+#define __va_rounded_size(TYPE)  \
+  (((sizeof (TYPE) + sizeof (int) - 1) / sizeof (int)) * sizeof (int))
+```
+>参数是通过栈传递的。这个宏确保每个参数都按照`int类型的对齐`要求来存储，这是许多架构上可变参数传递的标准做法。
+>先加上sizeof(int)-1，这是为了向上取整做准备
+
+
+#### 2.2 vsprintf
+再讲解write之前，先讲解一下`vsprintf()`：
+```c
+extern int vsprintf();
+```
+在linus中，我们专门为`vsprintf()`函数单开了一个文件：![../kernel/vsprintf.c](../kernel/vsprintf.c)
+对应vsprintf的实现如下：
+
+
+```c
+#define ZEROPAD	1		/* pad with zero */
+#define SIGN	2		/* unsigned/signed long */
+#define PLUS	4		/* show plus */
+#define SPACE	8		/* space if plus */
+#define LEFT	16		/* left justified */
+#define SPECIAL	32		/* 0x */
+#define SMALL	64		/* use 'abcdef' instead of 'ABCDEF' */
+
+/**
+ * func descp: 格式化输出函数，将可变参数列表按照格式化字符串的规则转换为字符串并存储到指定缓冲区。
+ * @param buf 输出缓冲区
+ * @param fmt 格式化字符串
+ * @param args 可变参数列表
+ * @return 输出字符串的长度
+ */
+// write(1, printbuf, i = vsprintf(printbuf, fmt, args));
+// 显然，这里vsprintf中的第一个参数就是缓冲区printbuf，第二个是fmt可变参数格式化字符串fmt，第三个是args可变参数列表args
+int vsprintf(char *buf, const char *fmt, va_list args)
+{
+
+    int len;          // 当前已输出的字符长度
+    char *str;        // 通常指向输出缓冲区当前位置
+    char *s;          // 临时字符串指针（用于处理 %s 格式）
+    int *ip;          // 用于读取整数参数（通过 va_arg）
+    int i;            // 循环计数器或临时整数存储
+    int flags;        // 格式化标志位掩码
+
+// flags 格式化标志位掩码如下：
+// 每一个位都不同，分别对应不同的格式化标志位。很美好！并且可以组合使用，不会冲突！这就是linus写的代码！
+// #define LEFT    0x01    /* 左对齐：'-' */
+// #define SIGN    0x02    /* 显示符号：'+' */
+// #define SPACE   0x04    /* 正数前加空格 */
+// #define ZEROPAD 0x08    /* 用零填充：'0' */
+// #define SMALL   0x10    /* 使用小写字母（十六进制） */
+// #define SPECIAL 0x20    /* 特殊前缀：'#' */
+// #define PLUS    0x40    /* 总是显示符号（已弃用，用SIGN） */
+
+    int field_width;  /* 输出字段宽度，如 %8d 中的 8 */
+    int precision;    /* 精度：
+                    - 整数：最少数字位数（如 %.4d）
+                    - 字符串：最大字符数（如 %.10s）*/
+    int qualifier;    /* 长度限定符：
+                    'h' - short（如 %hd）
+                    'l' - long（如 %ld）
+                    'L' - long double（如 %Lf）*/
+
+    for (str = buf; *fmt; ++fmt)/*所以我们也看到了，整个函数其实这里就是一个以fmt为界的循环*/
+    {
+        // 非格式化字符串，直接复制。要一直等到格式化字符(%开头的)，才开始工作。
+        // 这也确定了可以实现类似于printf("hello %s", "world");的功能，hello会直接打印。
+        if (*fmt != '%')
+        {
+            *str++ = *fmt;//缓冲区也要往前移动，因为这里写了东西了。
+            continue; 
+        }
+
+        /* process flags */
+        flags = 0; // 格式化标志位，最初全为0，因为刚好检测到了%，所以flags为0是正常的。下面要开始检测它了！
+
+    repeat:
+        ++fmt; /* this also skips first '%' *///显然会跳过第一个%，例如%+d，这里会跳过%，直接到+
+        // 处理格式化标志位
+        switch (*fmt)
+        {
+        //这里只处理5个，分别是-+ #0
+        case '-':
+            flags |= LEFT;
+            goto repeat;
+        case '+':
+            flags |= PLUS;
+            goto repeat;
+        case ' ':
+            flags |= SPACE;
+            goto repeat;
+        case '#':
+            flags |= SPECIAL;
+            goto repeat;
+        case '0':
+            flags |= ZEROPAD;
+            goto repeat;
+        }//当然，没重复一次，fmt就会++
+
+        /* get field width */
+        field_width = -1;
+        if (is_digit(*fmt))//如果不是数字，就说明不是宽度，就直接跳过
+        //is_digit的实现也很简单，宏实现的==> #define is_digit(c)	((c) >= '0' && (c) <= '9')
+        //可以看到，linus格外喜欢宏
+            field_width = skip_atoi(&fmt);//这里skip_atoi的含义是跳过字符串中的数字字符，返回数字的整数值。例如100xx，返回100
+        else if (*fmt == '*')//如果遇到了*，就说明是下一个参数，所以要从args中取一个int类型的参数，例如%*d，就说明宽度是下一个参数
+        {
+            /* it's the next argument */
+            field_width = va_arg(args, int);
+            if (field_width < 0)
+            {
+                field_width = -field_width;
+                flags |= LEFT;
+            }
+        }
+
+        /* get the precision */
+        precision = -1;
+        if (*fmt == '.')
+        {
+            ++fmt;
+            if (is_digit(*fmt))
+                precision = skip_atoi(&fmt);
+            else if (*fmt == '*')
+            {
+                /* it's the next argument */
+                precision = va_arg(args, int);
+            }
+            if (precision < 0)
+                precision = 0;
+        }
+
+        /* get the conversion qualifier */
+        qualifier = -1;
+        if (*fmt == 'h' || *fmt == 'l' || *fmt == 'L')
+        {
+            qualifier = *fmt;
+            ++fmt;
+        }
+
+        switch (*fmt)
+        {
+            // 对应的格式化字符是char类型
+
+        case 'c':
+            if (!(flags & LEFT))
+                while (--field_width > 0)
+                    *str++ = ' ';
+            *str++ = (unsigned char)va_arg(args, int);
+            while (--field_width > 0)
+                *str++ = ' ';
+            break;
+        // 对应的格式化字符是char*类型
+        case 's':
+            s = va_arg(args, char *);
+            len = strlen(s);
+            if (precision < 0)
+                precision = len;
+            else if (len > precision)
+                len = precision;
+
+            if (!(flags & LEFT))
+                while (len < field_width--)
+                    *str++ = ' ';
+            for (i = 0; i < len; ++i)
+                *str++ = *s++;
+            while (len < field_width--)
+                *str++ = ' ';
+            break;
+        // 对应的格式化字符是octal(8进制)类型
+        case 'o':
+            str = number(str, va_arg(args, unsigned long), 8,
+                         field_width, precision, flags);
+            break;
+        // 对应的格式化字符是pointer类型
+        case 'p':
+            if (field_width == -1)
+            {
+                field_width = 8;
+                flags |= ZEROPAD;
+            }
+            str = number(str,
+                         (unsigned long)va_arg(args, void *), 16,
+                         field_width, precision, flags);
+            break;
+        // 对应的格式化字符是hex(16进制)类型
+        case 'x':
+            flags |= SMALL;
+        case 'X':
+            str = number(str, va_arg(args, unsigned long), 16,
+                         field_width, precision, flags);
+            break;
+        // 对应的格式化字符是decimal(10进制)类型
+        case 'd':
+        // 对应的格式化字符是有符号数的decimal(10进制)类型，需要处理正负号
+        case 'i':
+            flags |= SIGN;
+            // 对应的格式化字符是unsigned decimal(10进制)类型
+        case 'u':
+            str = number(str, va_arg(args, unsigned long), 10,
+                         field_width, precision, flags);
+            break;
+            // 对应的格式化字符是 n（记录输出长度）类型
+            // 功能：将当前已输出的字符数写入指针指向的整数变量
+        case 'n':
+            ip = va_arg(args, int *);
+            *ip = (str - buf);
+            break;
+            // 处理未知格式符或 % 本身
+            // 功能：若为 % 则直接输出，否则输出 % + 未知字符
+        default:
+            // 情况1：如果当前字符不是 %（即 % 后面跟了未知字符，如 %k 中的 'k'）
+            if (*fmt != '%')
+                *str++ = '%'; // 先输出前面的 %
+            // 情况2：如果当前字符是 %（即 %% 中的第二个 %）
+            // 则不执行上面的 if，直接输出当前的 %
+
+            if (*fmt)
+                *str++ = *fmt; // 输出当前字符（未知字符或第二个 %）
+            else
+                --fmt; // 避免越界
+            break;
+        }
+        *str = '\0';/*标记内存中字符串结束*/
+        return str - buf; // 返回输出字符串的长度
+    }
+}
+```
+
+> 总之，这里的vsprintf就是将格式化字符串fmt中的内容按照参数args中的内容格式化，然后写入到str指向的内存中(`也就是我们的缓存区`)。
+
+>具体实现可以先不管，先把整体理清楚！
+
+#### 2.3 write系统调用1
+
+main中`printf`对应的调用是：
+```c
+write(1, printbuf, i = vsprintf(printbuf, fmt, args));
+```
+显然，这里就是向`文件描述符fildes`中写入`buf指向的内存[缓冲区]中`的`count个字节`。
+这里的文件描述符1，显然是标准输出stdout。
+
+对应的write系统调用实现如下：
+
+在文件![../lib/write.c](../lib/write.c)中定义，write系统调用的实现如下：
+```c
+_syscall3(int, write, int, fd, const char *, buf, off_t, count)
+//显然这是一个系统调用！
+```
+#### 2.4 sys_write系统调用实现，read_write.c
+那么既然是系统调用，上面的fork调用我们也讲的很清楚了，具体实现就没有write这个函数，而是拼接起来的sys_write:
+在对应文件![../fs/read_write.c](../fs/read_write.c)中定义，sys_write的实现如下：
+
+```c
+/**
+ * @brief 系统调用sys_write：将用户空间缓冲区数据写入文件
+ * @param fd 文件描述符
+ * @param buf 用户空间缓冲区（存放待写入数据）
+ * @param count 期望写入的字节数
+ * @return 成功：实际写入的字节数；失败：负错误码
+ */
+
+int sys_write(unsigned int fd, char *buf, int count)
+{
+    struct file *file;     // 文件结构指针
+    struct m_inode *inode; // 索引节点指针
+    // 参数合法性检查：
+    if (fd >= NR_OPEN || count < 0 || !(file = current->filp[fd])) // 1. 文件描述符超出范围 2. 写入字节数为负 3. 文件描述符未关联文件
+        return -EINVAL; // 错误：无效参数
+    if (!count)
+        return 0; // 写入0字节，直接返回0
+    inode = file->f_inode; // 获取文件对应的inode
+    // 根据文件类型分发到对应的写函数
+    if (inode->i_pipe) // 管道文件
+        return (file->f_mode & 2) ? write_pipe(inode, buf, count) : -EIO; // 检查文件是否以写模式打开（f_mode&2表示可写）
+    if (S_ISCHR(inode->i_mode)) // 字符设备文件
+        return rw_char(WRITE, inode->i_zone[0], buf, count, &file->f_pos); // 调用字符设备读写函数（WRITE标识）
+    if (S_ISBLK(inode->i_mode)) // 块设备文件
+        return block_write(inode->i_zone[0], &file->f_pos, buf, count); // 调用块设备写函数
+    if (S_ISREG(inode->i_mode)) // 普通文件
+        return file_write(inode, file, buf, count); // 调用普通文件写函数
+    printk("(Write)inode->i_mode=%06o\n\r", inode->i_mode); // 未知文件类型（错误处理）
+    return -EINVAL;
+}
+```
+
+我们可以看到，这里已经开始涉及文件系统inode之类的东西了，所以接下来，我们需要了解文件系统。
+让我们先放下当前的write系统调用，先了解文件系统。
+
+====
+
+## (七)文件系统

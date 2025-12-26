@@ -1568,3 +1568,4 @@ switch_to依然是定义在![../include/linux/sched.h](../include/linux/sched.h)
 
 ![如图，第一个TSS和LDT的位置](image-8.png)
 
+》=========2025年12月26日14:20:19再坚持坚持，终会成功的《===========

@@ -1963,12 +1963,12 @@ int sys_write(unsigned int fd, char *buf, int count)
 
 ## (七)文件系统
 
-### 1.文件系统概述
+### 1.一句话说完文件系统
 > 文件以二进制形式按照一定格式存在磁盘上，我们linux中的fs文件夹，就是定义如何按照磁盘中的数据存放格式，将其加载到内存中操作的一系列数据结构和方法。
 
 > 要设计什么样的软件，才能方便得将磁盘里面的数据读取出来呢？
 
-### 2.一句话--文件系统
+### 2.文件系统的几个重要概念
 
 #### 2.1分块和块位图
 磁盘被分成很多个块，文件内容就存放在这些块上。`块位图`位于块0，(显然是用bit标识的)用于`标识剩下的块有没有被使用`,使用则为1，未使用为0。
@@ -2051,3 +2051,135 @@ inode元信息`存放着一个文件的所有信息`，包括`文件大小、创
 
 两者的主要区别如下：
 ![我们的文件系统和ext2文件系统的区别](image-16.png)
+
+
+### 3.文件系统源码剖析
+#### 1.以sys_write为起点讲解
+接下来，让我们畅游在文件系统的源码里面吧~~
+
+首先，我们来看看linux中的内存架构：
+
+![linux将内存分为这几个部分(本版本不涉及虚拟盘)](image-17.png)
+
+具体的讲解，请点击此文：https://mp.weixin.qq.com/s/P8Lw_V8Y4ZVghv8pez1hpA
+
+我们不防以前面的![../fs/read_write.c](../fs/read_write.c)中的write系统调用`sys_write`为起点，逐一展开：
+
+```c
+/**
+ * @brief 系统调用sys_write：将用户空间缓冲区数据写入文件
+ * @param fd 文件描述符
+ * @param buf 用户空间缓冲区（存放待写入数据）
+ * @param count 期望写入的字节数
+ * @return 成功：实际写入的字节数；失败：负错误码
+ */
+int sys_write(unsigned int fd, char *buf, int count)
+{
+    struct file *file;     // 文件结构指针
+    struct m_inode *inode; // 索引节点指针
+
+    // 参数合法性检查：
+    // 1. 文件描述符超出范围 2. 写入字节数为负 3. 文件描述符未关联文件
+    if (fd >= NR_OPEN || count < 0 || !(file = current->filp[fd]))
+        return -EINVAL; // 错误：无效参数
+    if (!count)
+        return 0; // 写入0字节，直接返回0
+    // 获取文件对应的inode
+    inode = file->f_inode;
+
+    // 根据文件类型分发到对应的写函数
+    if (inode->i_pipe) // 管道文件
+        // 检查文件是否以写模式打开（f_mode&2表示可写）
+        return (file->f_mode & 2) ? write_pipe(inode, buf, count) : -EIO;
+    if (S_ISCHR(inode->i_mode)) // 字符设备文件
+        // 调用字符设备读写函数（WRITE标识）
+        return rw_char(WRITE, inode->i_zone[0], buf, count, &file->f_pos);
+    if (S_ISBLK(inode->i_mode)) // 块设备文件
+        // 调用块设备写函数l
+        return block_write(inode->i_zone[0], &file->f_pos, buf, count);
+    if (S_ISREG(inode->i_mode)) // 普通文件
+        // 调用普通文件写函数
+        return file_write(inode, file, buf, count);
+    // 未知文件类型（错误处理）
+    printk("(Write)inode->i_mode=%06o\n\r", inode->i_mode);
+    return -EINVAL;
+}
+```
+
+首先，我们讲解参数：
+```c
+int sys_write(unsigned int fd, char *buf, int count)
+```
+这里的参数分别是：
+- `fd`：文件描述符，用于指定要写入的文件。
+- `buf`：用户空间缓冲区，包含待写入的数据。
+- `count`：期望写入的字节数。
+
+那么何为文件描述符？
+
+#### 2.文件描述符fd
+> 文件描述符是一个非负整数，`表示已打开文件的索引。`每个进程都有一个文件描述符表，记录了`该进程打开的所有文件。`这在上面已经说过了。那对于整个系统而言，文件描述符是啥呢？
+
+一个主观直觉就是，这个描述符是唯一定位的一个文件的标志。没错！
+
+————linux系统中，`所有打开的文件都存放在一个全局数组里面：`
+
+位于文件[../fs/file_table.c](../fs/file_table.c)里面的唯一定义的全局数组。
+>所谓文件描述符，`就是这个数组的索引！`
+也就代表着，打开的某个文件！
+```c
+#include <linux/fs.h>
+#define NR_FILE 64
+struct file file_table[NR_FILE];
+```
+可以看到，整个系统只能打开64个文件。
+
+那么这里的结构体file是啥呢？显然这是对于文件抽象，下面讲解它
+
+#### 3.file结构体
+定义位于文件[../include/linux/fs.h](../include/linux/fs.h)中
+```c
+// 文件结构，代表一个打开的文件
+struct file
+{
+    unsigned short f_mode;   /* 文件模式（读写等） */
+    unsigned short f_flags;  /* 文件标志 */
+    unsigned short f_count;  /* 引用计数 */
+    struct m_inode *f_inode; /* 关联的inode */
+    off_t f_pos;             /* 文件当前位置 */
+};
+```
+> 这个结构体表示一个打开的文件，包含了文件的各种属性和状态信息。
+
+#### 4.m_inode 结构体
+这是仅仅在内存中的inode结构体。`fs中的文件系统也就是在内存中为底层的磁盘数据提供何时的读取数据结构罢了。`
+所以这里的运行在内存中的inode。
+
+```c
+// 内存中的 inode 结构，比磁盘的 inode 多了一些运行时需要的字段
+struct m_inode
+{
+    unsigned short i_mode;
+    unsigned short i_uid;
+    unsigned long i_size;
+    unsigned long i_mtime; /* 修改时间 */
+    unsigned char i_gid;
+    unsigned char i_nlinks;
+    unsigned short i_zone[9];
+
+    /* 以下是仅在内存中的字段 */
+    struct task_struct *i_wait; /* 等待该inode的任务 */
+    unsigned long i_atime;      /* 访问时间 */
+    unsigned long i_ctime;      /* 创建时间 */
+    unsigned short i_dev;       /* 设备号 */
+    unsigned short i_num;       /* inode号 */
+    unsigned short i_count;     /* 引用计数 */
+    unsigned char i_lock;       /* 锁定标志 */
+    unsigned char i_dirt;       /* 脏标志（是否被修改） */
+    unsigned char i_pipe;       /* 是否为管道 */
+    unsigned char i_mount;      /* 是否为挂载点 */
+    unsigned char i_seek;       /* 寻道标志 */
+    unsigned char i_update;     /* 更新标志 */
+};
+```
+

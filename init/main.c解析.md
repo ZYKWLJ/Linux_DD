@@ -2105,7 +2105,7 @@ int sys_write(unsigned int fd, char *buf, int count)
     return -EINVAL;
 }
 ```
-
+#### 2.sys_write参数讲解
 首先，我们讲解参数：
 ```c
 int sys_write(unsigned int fd, char *buf, int count)
@@ -2117,7 +2117,7 @@ int sys_write(unsigned int fd, char *buf, int count)
 
 那么何为文件描述符？
 
-#### 2.文件描述符fd
+##### 1.文件描述符fd
 > 文件描述符是一个非负整数，`表示已打开文件的索引。`每个进程都有一个文件描述符表，记录了`该进程打开的所有文件。`这在上面已经说过了。那对于整个系统而言，文件描述符是啥呢？
 
 一个主观直觉就是，这个描述符是唯一定位的一个文件的标志。没错！
@@ -2136,27 +2136,29 @@ struct file file_table[NR_FILE];
 
 那么这里的结构体file是啥呢？显然这是对于文件抽象，下面讲解它
 
-#### 3.file结构体
+##### 2.file结构体
 定义位于文件[../include/linux/fs.h](../include/linux/fs.h)中
 ```c
+typedef long off_t;
 // 文件结构，代表一个打开的文件
 struct file
 {
     unsigned short f_mode;   /* 文件模式（读写等） */
     unsigned short f_flags;  /* 文件标志 */
     unsigned short f_count;  /* 引用计数 */
-    struct m_inode *f_inode; /* 关联的inode */
+    struct m_inode *f_inode; /* 关联的inode,这个就是我们常说的文件的唯一元信息。同时将其他常常访问的也一并提取出来了。*/
     off_t f_pos;             /* 文件当前位置 */
 };
 ```
+
 > 这个结构体表示一个打开的文件，包含了文件的各种属性和状态信息。
 
-#### 4.m_inode 结构体
+##### 3.m_inode 结构体
 这是仅仅在内存中的inode结构体。`fs中的文件系统也就是在内存中为底层的磁盘数据提供何时的读取数据结构罢了。`
 所以这里的运行在内存中的inode。
 
 ```c
-// 内存中的 inode 结构，比磁盘的 inode 多了一些运行时需要的字段
+// 内存中的 inode 结构，所以叫m_inode，因为比磁盘的 inode 多了一些运行时需要的字段
 struct m_inode
 {
     unsigned short i_mode;
@@ -2165,7 +2167,7 @@ struct m_inode
     unsigned long i_mtime; /* 修改时间 */
     unsigned char i_gid;
     unsigned char i_nlinks;
-    unsigned short i_zone[9];
+    unsigned short i_zone[9];//这里就是我们的9个块，其中也有一级二级索引的。
 
     /* 以下是仅在内存中的字段 */
     struct task_struct *i_wait; /* 等待该inode的任务 */
@@ -2182,4 +2184,238 @@ struct m_inode
     unsigned char i_update;     /* 更新标志 */
 };
 ```
+好了，到这里，我们文件的所有信息都已经具备了。总的来说，就是file结构体表示文件，里面的inode又是一个文件元数据结构体。
+讲了`file`和`inode`结构体，Linux中的文件也就讲完了！
 
+> `怎么样，是不是很简单？`
+
+#### 3.sys_write参数合法性检测
+这里就是针对写入的参数进行检测，显然 ，检测的点都已经写在注释里面了。
+```c
+    // 系统限制常量：
+    // 每个进程最大打开文件数：20
+    #define NR_OPEN 20
+    // 参数合法性检查：
+    // 1. 文件描述符超出范围 2. 写入字节数为负 3. 文件描述符未关联文件
+    if (fd >= NR_OPEN || count < 0 || !(file = current->filp[fd]))
+        return -EINVAL; // 错误：无效参数
+    if (!count)
+        return 0; // 写入0字节，直接返回0
+    // 获取文件对应的inode
+```
+其中，`EINVAL`定义于：![../include/errno.h](../include/errno.h)里面
+含义为，无效的参数，`Error INVALID argument`
+```c
+#ifndef _ERRNO_H
+#define _ERRNO_H
+// 声明一个外部全局整数变量errno。
+// 作用：errno是 C 语言中用于保存最近一次系统调用或库函数错误状态的变量，由系统自动设置。
+extern int errno;
+/**
+* data descp: 命名规则：以E开头，后续字母为错误描述的缩写（如EPERM即 "Error PERMission"）。
+* 这些错误码对应系统调用或库函数执行失败的具体原因，应用程序可通过errno获取并判断错误类型。
+*/
+#define ERROR		99    // 定义通用错误码ERROR，值为 99（可能用于未明确分类的错误）。
+#define EPERM		 1    // Operation not permitted（操作不允许：权限不足）
+#define ENOENT		 2    // No such file or directory（无此文件或目录）
+#define ESRCH		 3    // No such process（无此进程）
+#define EINTR		 4    // Interrupted system call（系统调用被中断）
+#define EIO		 5    // I/O error（输入/输出错误）
+#define ENXIO		 6    // No such device or address（无此设备或地址）
+#define E2BIG		 7    // Argument list too long（参数列表过长）
+#define ENOEXEC		8    // Exec format error（执行格式错误：文件不可执行）
+#define EBADF		 9    // Bad file descriptor（无效的文件描述符）
+#define ECHILD		10   // No child processes（无子进程）
+#define EAGAIN		11   // Try again（资源暂时不可用，可重试）
+#define ENOMEM		12   // Out of memory（内存不足）
+#define EACCES		13   // Permission denied（权限被拒绝）
+#define EFAULT		14   // Bad address（无效的内存地址）
+#define ENOTBLK		15   // Block device required（需要块设备）
+#define EBUSY		16   // Device or resource busy（设备或资源正忙）
+#define EEXIST		17   // File exists（文件已存在）
+#define EXDEV		18   // Cross-device link（跨设备链接）
+#define ENODEV		19   // No such device（无此设备）
+#define ENOTDIR		20   // Not a directory（不是目录）
+#define EISDIR		21   // Is a directory（是目录，而非文件）
+//.......
+//剩下很多
+#endif
+```
+
+#### 4.或者文件的inode
+```c
+// 获取文件对应的inode
+    inode = file->f_inode;
+```
+这一步没什么好说的，因为这是文件元数据。
+
+#### 5.根据文件类型分发到对应的写函数
+显然，这说明在Linux中存在多个类型的文件，不同文件有不同处理！
+比如这里给出的：`管道、字符、块、普通文件。`
+```c
+  // 根据文件类型分发到对应的写函数
+    if (inode->i_pipe) // 管道文件
+        // 检查文件是否以写模式打开（f_mode&2表示可写）
+        return (file->f_mode & 2) ? write_pipe(inode, buf, count) : -EIO;
+    if (S_ISCHR(inode->i_mode)) // 字符设备文件
+        // 调用字符设备读写函数（WRITE标识）
+        return rw_char(WRITE, inode->i_zone[0], buf, count, &file->f_pos);
+    if (S_ISBLK(inode->i_mode)) // 块设备文件
+        // 调用块设备写函数
+        return block_write(inode->i_zone[0], &file->f_pos, buf, count);
+    if (S_ISREG(inode->i_mode)) // 普通文件
+        // 调用普通文件写函数
+        return file_write(inode, file, buf, count);
+    // 未知文件类型（错误处理）
+    printk("(Write)inode->i_mode=%06o\n\r", inode->i_mode);
+    return -EINVAL;
+```
+
+这里其实写法不好，因为这么多if判断，导致后面的分支一定会否定前面的分支。`是典型的低效率写法。`这种该使用`switch`。
+
+【可见，即便是`强如linus也有写的不好的时候。`】
+
+##### 1.写管道操作
+
+```c
+    // 根据文件类型分发到对应的写函数
+    if (inode->i_pipe) // 管道文件
+    // 检查文件是否以写模式打开（f_mode&2表示可写）
+    return (file->f_mode & 2) ? write_pipe(inode, buf, count) : -EIO;
+```
+
+
+这里的`write_pipe`函数实现位于文件[../fs/pipe.c](../fs/pipe.c)中，具体实现如下：
+
+```c
+/**
+ * @brief 向管道写入数据
+ * @param inode 管道对应的索引节点，存储管道缓冲区信息
+ * @param buf 用户空间缓冲区，提供待写入的数据
+ * @param count 期望写入的字节数
+ * @return 实际写到的字节数；若管道无读进程，返回-1并发送SIGPIPE信号
+ */
+int write_pipe(struct m_inode *inode, char *buf, int count)
+{
+    int chars;       // 当前写入的字节数
+    int size;        // 管道中可写入的空闲空间
+    int written = 0; // 累计写入的总字节数
+    // 循环写入直到满足期望字节数或管道满
+    while (count > 0)
+    {
+        // 管道满了，执行到里面去。
+        while (!(size = (PAGE_SIZE - 1) - PIPE_SIZE(*inode)))//（计算可写入的最大空间）
+        {
+            wake_up(&inode->i_wait); // 唤醒等待在该管道上的读进程(将写入的数据读走)
+            // 检查是否还有读进程（i_count为2表示有读写进程）
+            // 表示就算执行了进程的唤醒操作，也没有读取该管道的进程，说明此时，管道满了，也没有进程来读，所以直接返回了。那么就直接发送SIGPIPE信号，并返回累计写入的总字节数
+            if (inode->i_count != 2)
+            {
+                // 无读进程，发送SIGPIPE信号给当前进程
+                current->signal |= (1 << (SIGPIPE - 1));
+                // 返回已读到的字节数，若无则返回-1
+                return written ? written : -1;
+            }
+            //如果管道满，但是有读进程来读管道内容，那么写进程睡眠，静默地等待读进程取走数据。直到有空间。
+            sleep_on(&inode->i_wait); 
+        }
+        // 计算当前可写入管道头部的最大字节数（不超过一页）
+        chars = PAGE_SIZE - PIPE_HEAD(*inode);
+        // 限制写入量不超过剩余请求数
+        if (chars > count)
+            chars = count;
+        // 限制写入量不超过管道空闲空间
+        if (chars > size)
+            chars = size;
+        // 更新剩余请求数和已写入总数
+        count -= chars;
+        written += chars;
+        // 记录当前管道头部位置，更新头部指针（循环缓冲区）
+        size = PIPE_HEAD(*inode);
+        PIPE_HEAD(*inode) += chars;
+        // 用与运算实现环形缓冲区
+        PIPE_HEAD(*inode) &= (PAGE_SIZE - 1);
+        // 将用户空间数据复制到内核管道缓冲区
+        while (chars-- > 0)
+            ((char *)inode->i_size)[size++] = get_fs_byte(buf++);
+    }
+    wake_up(&inode->i_wait); // 唤醒可能等待的读进程
+    return written;
+}
+```
+
+这里讲到了管道，设计较为复杂，详细过程我们暂且将之放一放，只需要知道：
+
+- `管道`本质上是一块`内存`，`在形式上，是一个环形缓冲区FIFO`。在Linux中，被抽象为文件。
+
+- `管道操作`的本质是开启一个读进程，一个写进程，`两个进程的文件描述符都指向同一个文件——管道`，写进程将数据写进管道中，读进程来读，通过管道这种中介的方式进行通信。如图：
+
+
+![管道操作的本质图示](image-18.png)
+
+
+##### 2.wake_up函数
+```c
+void wake_up(struct task_struct **p)
+{
+	if (p && *p) {
+		(**p).state=0;
+		*p=NULL;
+	}
+}
+```
+这就是纯唤醒操作，只是将进程的状态设置为就绪(Runnable=0)，然后将进程指针设置为NULL。
+> 注意这里采用的二级指针，因为这里`要彻彻底底改变一级指针的值p`。
+
+##### 2.隐式的单向链式栈结构。
+这里要彻底理解wake_up函数，需要理解`隐式的单向链式栈结构`。
+inode->i_wait是一个环形等待队列，用来`存储等待在该管道上的进程。`
+
+```c
+// 内存中的 inode 结构，比磁盘的 inode 多了一些运行时需要的字段
+struct m_inode
+{
+    /* 以下是仅在内存中的字段 */
+    struct task_struct *i_wait; /* 等待该inode的任务 */
+    //省略掉其他的字段
+};
+```
+`i_wait`显然这是一个链表。每个inode上都有一个等待队列，用来存储除了此刻拥有inode进程之外的，还在等待该inode的其他进程。
+
+那么这个隐式的单向链式栈结构是怎么工作的呢？
+
+- 当一个进程等待在该管道上时，会将自己加入到该管道的等待栈中。当管道有数据可读时，会唤醒等待在该管道上的进程。
+> 注意这里采用的是`隐式的单向链式栈结构`，而不是`显式的环形队列结构`。
+
+##### 3.SIGPIPE信号
+这是定义在![../include/signal.h](../include/signal.h)里面的宏
+```c
+#define SIGPIPE		13
+```
+这代表一个信号值。这里涉及的知识依然很复杂，我们暂时将信号的知识放一放，就像讲解管道一样，仅仅只需要知道：
+
+- 信号在Linux源码层面的体现就是，他是进程结构体的一个字段(long signal)，这注定了最多有64个信号(Linux0.11是32个)。
+
+- 信号在功能层面的体现就是，通过signal的每一种结果，控制进程的行为。
+
+- 信号在触发层面的体现就是，可以通过键盘触发，比如按下ctrl-c，就是结束进程。也可以通过软件触发，直接修改singal字段就好了。本质都是通过修改signal字段，控制进程的行为。
+
+##### 4.sleep_on函数
+```c
+void sleep_on(struct task_struct **p)
+{
+    struct task_struct *tmp;
+
+    if (!p)
+        return;
+    if (current == &(init_task.task))
+        panic("task[0] trying to sleep");
+    tmp = *p;
+    *p = current;
+    current->state = TASK_UNINTERRUPTIBLE;
+    schedule();
+    if (tmp)
+        tmp->state = 0;
+}
+```
+因为前面尝试唤醒所有为此管道等待的进程，如果没有的话，就

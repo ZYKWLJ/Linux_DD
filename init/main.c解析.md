@@ -2526,6 +2526,7 @@ if (S_ISCHR(inode->i_mode)) // 字符设备文件
         // 调用字符设备读写函数（WRITE标识）
         return rw_char(WRITE, inode->i_zone[0], buf, count, &file->f_pos);
 ```
+##### 2.S_ISCHR宏是啥？
 这里先看看`S_ISCHR`宏是啥？
 具体在文件：[../include/sys/stat.h](../include/sys/stat.h)中
 
@@ -2596,3 +2597,205 @@ struct stat {
 -------
 
 所以这里就是通过`m_inode`的`i_mode字段`来识别`文件的类型`的,这里的宏的判断很到位，并且取名也很经典，IS、IF等等一幕了然。
+
+##### 3.rw_char函数写入字符设备
+rw_char函数原定义于文件[../fs/char_dev.c](../fs/char_dev.c)中
+rw_char函数是Linux 0.11 内核中`字符设备的读写通用入口函数`，核心作用是「`统一封装字符设备的读写逻辑`，根据设备号`分发请求`到`对应具体字符设备`的`驱动处理函数`」。
+
+
+```c
+int rw_char(int rw,int dev, char * buf, int count, off_t * pos)
+//参数分别为：读写操作标识、设备号、数据缓冲区、数据长度、文件位置指针
+{
+	crw_ptr call_addr;
+
+	if (MAJOR(dev)>=NRDEVS) 
+    //NRDEVS：内核定义的「系统最大支持的字符设备主设备号数量」，是一个常量；
+		return -ENODEV;//#define ENODEV		19   // No such device（无此设备）
+	if (!(call_addr=crw_table[MAJOR(dev)]))
+    //如果内核中没有这个主设备号对应的字符设备驱动函数指针，就返回-ENODEV
+		return -ENODEV;
+    //调用具体设备的驱动函数，传递参数并返回执行结果
+	return call_addr(rw,MINOR(dev),buf,count,pos);
+}
+```
+让我们逐一进行讲解：
+
+- 函数定位：
+
+这是字符设备读写的`「中间层封装函数」`，不是具体的设备驱动实现，而是**负责 “请求分发” 的通用入口**。
+
+-  关键概念铺垫：
+
+> **设备号（dev）**：Linux 中`每个设备都有唯一的设备号`，分为「`主设备号（MAJOR (dev)）`」和「`次设备号（MINOR (dev)）`」：
+
+> **主设备号**：`标识设备的类型`（如键盘、鼠标、串口，`对应不同的驱动程序`）；
+
+> **次设备号**：`标识同一类型下的` **具体设备实例**（如串口 1、串口 2，**对应同一驱动下的不同设备**）；
+
+> **crw_table**：内核中的「**字符设备驱动函数表**」（本质是一个**函数指针数组**），数组`下标对应主设备号`，数组元素是对应字符设备的`具体读写处理函数指针`（`crw_ptr`类型）；
+
+> **crw_ptr**：`字符设备读写函数指针类型定义`，其`指向的函数必须遵循固定参数格式`（rw, MINOR(dev), buf, count, pos），这是**内核对字符设备驱动读写函数的统一规范**。
+注意，全称是Character Read/Write Function Pointer（字符设备读写函数指针）
+ 
+----- 
+
+上文提到的函数指针和函数指针表，定义如下：
+```c
+typedef int (*crw_ptr)(int rw,unsigned minor,char * buf,int count,off_t * pos);
+```
+指针表（crw_table）
+```c
+static crw_ptr crw_table[]={
+	NULL,		/* nodev */
+	rw_memory,	/* /dev/mem etc */
+	NULL,		/* /dev/fd */
+	NULL,		/* /dev/hd */
+	rw_ttyx,	/* /dev/ttyx */
+	rw_tty,		/* /dev/tty */
+	NULL,		/* /dev/lp */
+	NULL};		/* unnamed pipes */
+```
+这里我们再来看看具体的驱动函数：
+
+##### 1.rw_memory
+这是字符设备驱动函数`rw_memory`的实现，用于处理`内存设备`（如`/dev/ram`、`/dev/mem`、`/dev/kmem`等）的读写操作。
+```c
+static int rw_memory(int rw, unsigned minor, char *buf, int count, off_t *pos)
+{
+    // 根据次设备号，调度到对应设备的读写逻辑
+    switch (minor)
+    {
+    case 0:
+        return rw_ram(rw, buf, count, pos);    // minor=0 → /dev/ram（内存盘）
+    case 1:
+        return rw_mem(rw, buf, count, pos);    // minor=1 → /dev/mem（物理内存）
+    case 2:
+        return rw_kmem(rw, buf, count, pos);   // minor=2 → /dev/kmem（内核内存）
+    case 3:
+        // minor=3 → /dev/null（空设备）：读返回0（无数据），写返回请求字节数（数据丢弃）
+        return (rw == READ) ? 0 : count;
+    case 4:
+        return rw_port(rw, buf, count, pos);   // minor=4 → /dev/port（IO端口）
+    default:
+        return -EIO;  // 未知次设备号，返回IO错误
+    }
+}
+```
+
+下面详细看看内存设备的分支处理：
+注意，Linux0.11中，`追求极简`，所以只实现了`/dev/port`这个`内存设备的驱动函数`。其他的没有实现。直接返回`-EIO`。
+
+```c
+static int rw_ram(int rw,char * buf, int count, off_t *pos)
+{
+	return -EIO;
+}
+
+static int rw_mem(int rw,char * buf, int count, off_t * pos)
+{
+	return -EIO;
+}
+
+static int rw_kmem(int rw,char * buf, int count, off_t * pos)
+{
+	return -EIO;
+}
+
+//功能定位：专门处理 x86 架构的硬件 I/O 端口读写，仅支持字节级传输（每次读写 1 个字节），对应 x86 汇编的inb/outb指令。
+static int rw_port(int rw,char * buf, int count, off_t * pos)
+{
+	int i=*pos;
+
+	while (count-->0 && i<65536) {
+		if (rw==READ)
+			put_fs_byte(inb(i),buf++);
+		else
+			outb(get_fs_byte(buf++),i);
+		i++;
+	}
+	i -= *pos;//计算实际传输的字节数
+	*pos += i;//更新端口偏移量指针
+	return i; //返回实际传输的字节数
+}
+```
+
+##### 2.rw_port
+- IO端口与网络端口的区别
+
+这里的port是「硬件 I/O 端口」（Hardware I/O Port），属于**计算机硬件架构**（x86 架构）范畴，是**硬件设备与 CPU 通信的专用接口**；
+
+而我们进程绑定的 “端口”：全称是 「网络端口」（Network Port），属于计算机网络协议（TCP/IP 协议栈）范畴 ，是操作系统**区分不同网络应用进程的逻辑标识。**
+
+- 关键背景：
+
+x86 架构的 I/O 端口`独立于内存空间`，范围固定为`0~65535`（16 位端口地址，共 `65536 个端口`）；
+函数中的`inb()/outb()`是`封装好的汇编指令宏`，分别用于 “`从端口读 1 字节`” 和 “`向端口写 1 字节`”；
+put_fs_byte()/get_fs_byte()是`内核数据传输宏`，负责`在内核空间与fs段映射的用户空间`之间传递单个字节数据。
+
+- 参数承接：
+
+继承自`crw_ptr函数指针规范`，核心参数rw（读写标识）、buf（数据缓冲区）、count（期望字节数）、pos（端口起始地址偏移）均`由rw_memory透传而来`。
+
+----
+
+下面，我们着重讲解这里面的`put_fs_byte`、`inb`、`outb`、`get_fs_byte`函数。
+
+##### 3.put_fs_byte
+下面是详细实现：
+具体位于[../include/asm/segment.h](../include/asm/segment.h)中
+```c
+static inline void put_fs_byte(char val,char *addr)
+{
+    __asm__ ("
+        movb %0,%%fs:%1"
+        ::
+        "r" (val),
+        "m" (*addr)
+    );
+}
+```
+其实这里和上面的`get_fs_byte`是对应的。下面是`get_fs_byte`的实现，我们看看有何不同：
+```c
+static inline unsigned char get_fs_byte(const char * addr)/*addr的本质 ——「fs段内的偏移量」*/
+{
+	unsigned register char _v;
+    __asm__ ("
+        movb %%fs:%1,%0"
+        :"=r" (_v)
+        :"m" (*addr)
+    );
+	return _v;
+}
+```
+刚刚先发 而已，`get_fs_byte`实现的是`从用户空间`写到`内核空间`，而`put_fs_byte`实现的是`从内核空间`写到`用户空间`。
+两者刚刚相反而已！
+
+##### 4.inb
+位于文件[../include/asm/io.h](../include/asm/io.h)中
+这是`inb`的宏实现，用于`从指定的 IO 端口读取一个字节。`
+
+-  GCC表达式的特点
+_v是返回值，GCC表达式的特点是会执行大括号内的所有语句，最终将大括号内最后一个表达式的值作为整个语句表达式的返回值。
+```c
+#define inb(port) ({ \
+    unsigned char _v; \
+    __asm__ volatile ("
+            inb %%dx,%%al"  //使用inb命令从端口读取字节到指定寄存器。这里是从 %dx 端口读取一个字节到 %al 寄存器
+            :"=a" (_v)      //"=a" 表示将 %eax 寄存器的值写入变量 __res（`a 对应 %eax，= 表示只写`）
+            :"d" (port)     // "d" (port) 表示将 port 参数值加载到 %edx 寄存器（`d 对应 %edx`）
+        ); \
+    _v; \ //
+})
+```
+##### 5.outb
+这是`outb`的宏实现，用于`向指定的 IO 端口写入一个字节。`
+```c
+#define outb(value,port) \
+__asm__ ("
+    outb %%al,%%dx" //使用outb命令将 %al 寄存器的值写入端口 %dx
+    ::
+    "a" (value),    // "a" (val) 表示将 value 参数值加载到 %eax 寄存器（`a 对应 %eax`）
+    "d" (port)      // "d" (port) 表示将 port 参数值加载到 %edx 寄存器（`d 对应 %edx`）
+)
+```

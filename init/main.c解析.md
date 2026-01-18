@@ -2475,10 +2475,43 @@ PAGE_SIZE默认值为 4096，PAGE_SIZE-1即为 4095（二进制是**111111111111
 
 
 ##### 6.get_fs_byte函数
+
 在write_pipe函数中，chars是管道中还可以写入的字节数。
-这里出现了get_fs_byte函数，我们重点剖析
+这里出现了`get_fs_byte`函数，我们重点剖析
 ```c
 // 将用户空间数据复制到内核管道缓冲区
 while (chars-- > 0)
     ((char *)inode->i_size)[size++] = get_fs_byte(buf++);
 ```
+下面是详细实现：
+具体位于[../include/asm/segment.h](../include/asm/segment.h)中
+```c
+static inline unsigned char get_fs_byte(const char * addr)/*addr的本质 ——「fs段内的偏移量」*/
+{
+	unsigned register char _v;
+
+__asm__ ("
+    movb %%fs:%1,%0"
+    :"=r" (_v)
+    :"m" (*addr)
+);
+	return _v;
+}
+// 功能：从用户空间地址addr读取 1 个字节（8 位）。
+// 汇编解析：movb %%fs:%1,%0表示从fs段选择符指定的内存段中
+// :"m" (*addr),这是%1，结合上面的movb操作，这里是指，将读取%1（即*addr指向的内存）处的 1 字节数据到%0（即变量_v）。
+// :"=r"(_v) ,首先，"=r"是 GCC 内联汇编的输出操作数约束，=表示只写输出，r表示使用编译器自动选择的通用寄存器；
+// 这里的%0,表示将内联汇编执行的结果，写入到编译器自动选择的一个通用寄存器中，再由该寄存器将结果同步到 C 语言变量_v中（_v是汇编操作的输出目标）。
+```
+所以这里的本质就是，将`用户空间的addr`指向的`内存中的 1 字节数据`，读取到内核空间的_v变量中。
+
+
+
+
+
+
+
+
+
+
+

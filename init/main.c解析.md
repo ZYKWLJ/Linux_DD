@@ -2245,7 +2245,7 @@ extern int errno;
 #### 4.或者文件的inode
 ```c
 // 获取文件对应的inode
-    inode = file->f_inode;
+inode = file->f_inode;
 ```
 这一步没什么好说的，因为这是文件元数据。
 
@@ -2274,6 +2274,8 @@ extern int errno;
 这里其实写法不好，因为这么多if判断，导致后面的分支一定会否定前面的分支。`是典型的低效率写法。`这种该使用`switch`。
 
 【可见，即便是`强如linus也有写的不好的时候。`】
+
+接下来就剖析上面的每一个分支的每一个操作，第一个是`write_pipe`。
 
 ##### 1.写管道操作
 
@@ -2398,24 +2400,85 @@ struct m_inode
 
 - 信号在功能层面的体现就是，通过signal的每一种结果，控制进程的行为。
 
-- 信号在触发层面的体现就是，可以通过键盘触发，比如按下ctrl-c，就是结束进程。也可以通过软件触发，直接修改singal字段就好了。本质都是通过修改signal字段，控制进程的行为。
+- 信号在触发层面的体现就是，可以通过键盘触发，比如按下ctrl-c，就是结束进程。也可以通过软件触发，直接修改singal字段就好了。**本质都是通过修改signal字段，控制进程的行为。**
 
 ##### 4.sleep_on函数
+这里是让p进程睡眠的。
+注意，task[0]是怠速进程，不可以睡眠，所以这里要判断一下。
+
+这里就是让`当前进程进入不可中断睡眠、挂载到等待队列`，并唤醒队列中前一个进程
+本质就是**链式唤醒**
 ```c
-void sleep_on(struct task_struct **p)
+void sleep_on(struct task_struct **p)/*p:这是一个指向 “进程队列头指针” 的指针，本质是用来维护一个简单的进程睡眠等待队列（单链表形式）*/
 {
     struct task_struct *tmp;
 
     if (!p)
         return;
-    if (current == &(init_task.task))
+    if (current == &(init_task.task))/*current是内核中的全局宏，指向当前正在占用 CPU 运行的进程的 task_struct 结构体（*/
         panic("task[0] trying to sleep");
+    // 3.1 备份等待队列中原有的旧头节点进程指针到临时变量tmp
     tmp = *p;
+    // 3.2 将当前进程（current）赋值给*p，成为等待队列的新头节点
     *p = current;
     current->state = TASK_UNINTERRUPTIBLE;
-    schedule();
-    if (tmp)
-        tmp->state = 0;
+    schedule();//这里的调度是指，将当前进程调度出去，让其他进程运行。
+    if (tmp)//链式唤醒，唤醒等待队列中的前一个进程。
+        tmp->state = 0;//这里是指，将等待队列中的前一个进程唤醒的进程设置为就绪状态。
 }
 ```
-因为前面尝试唤醒所有为此管道等待的进程，如果没有的话，就
+##### 5.PIPE_HEAD宏
+```c
+chars = PAGE_SIZE - PIPE_HEAD(*inode);
+```
+这个PIPE_HEAD宏，经常出现，我们剖析：
+原定义于文件[../include/linux/fs.h](../include/linux/fs.h)中
+下面都是管道的操作核心辅助宏，如下：
+```c
+#define PIPE_HEAD(inode) ((inode).i_zone[0])
+#define PIPE_TAIL(inode) ((inode).i_zone[1])
+#define PIPE_SIZE(inode) ((PIPE_HEAD(inode)-PIPE_TAIL(inode))&(PAGE_SIZE-1)) /*确保大小不会超过PAGE_SIZE-1，这是一个很重要的技巧，并且通过与操作，极大提升速率！*/
+#define PIPE_EMPTY(inode) (PIPE_HEAD(inode)==PIPE_TAIL(inode))
+#define PIPE_FULL(inode) (PIPE_SIZE(inode)==(PAGE_SIZE-1))
+#define INC_PIPE(head) \
+__asm__(
+    "incl %0\n\t
+    andl $4095,%0"
+    ::
+    "m" (head)
+)
+//这里通过内联汇编代码，保证了操作的原子性—— 递增和绕回两步操作合为一个不可分割的指令序列，避免多进程并发操作管道时出现数据竞争（比如两个进程同时写管道，导致头指针更新错误）。
+//内联汇编在上面有详细的讲解，本质上是，将上面的源码分为两部分，`：：`前面的是操作，`：：`后面的是赋值。CPU会`先执行`后面的赋值，然后返回前面的操作环节。
+//这里就是指定第一个操作数为内存(因为是"m"开头的，)，具体为内存head处，然后，操作环节就是"incl %0\n\t"，即递增head指针。
+//最后，通过"andl $4095,%0"，确保head指针在0~4095之间。
+```
+###### 5.1理解前提基础：
+---
+
+1. 管道的存储载体：
+
+Linux 0.11 的管道基于**inode结构体**实现，管道的读写缓冲区是一块大小为**PAGE_SIZE**（默认 4096 字节，即 4K）的**物理页面**，而**inode的i_zone[]数组**（原本用于记录文件数据块地址）**被复用，专门存储管道的核心控制信息**：
+
+- `i_zone[0]`：记录管道的读 / 写头指针（HEAD）（实际是缓冲区中的偏移量，范围 0~4095）；
+- `i_zone[1]`：记录管道的读 / 写尾指针（TAIL）（同样是缓冲区偏移量，范围 0~4095）。
+---
+
+2. 管道的缓冲区结构：
+
+采用 **环形缓冲区（循环缓冲区）** 设计，当指针偏移量达到PAGE_SIZE-1（4095）后，**再递增就会回到 0**，实现缓冲区的循环复用，避免内存浪费。
+
+---
+
+3. 核心常量：
+
+PAGE_SIZE默认值为 4096，PAGE_SIZE-1即为 4095（二进制是**111111111111**），用于限制指针偏移量不超出缓冲区范围。
+
+
+##### 6.get_fs_byte函数
+在write_pipe函数中，chars是管道中还可以写入的字节数。
+这里出现了get_fs_byte函数，我们重点剖析
+```c
+// 将用户空间数据复制到内核管道缓冲区
+while (chars-- > 0)
+    ((char *)inode->i_size)[size++] = get_fs_byte(buf++);
+```

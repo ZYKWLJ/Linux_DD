@@ -2799,3 +2799,308 @@ __asm__ ("
     "d" (port)      // "d" (port) 表示将 port 参数值加载到 %edx 寄存器（`d 对应 %edx`）
 )
 ```
+
+好了，到了这里，我们才走完写系统调用`sys_write`的IS_IFCHR的分类，即字符设备。
+接下来，让我们来看`块设备文件`：
+
+```c
+ if (S_ISBLK(inode->i_mode)) // 块设备文件
+        // 调用块设备写函数
+        return block_write(inode->i_zone[0], &file->f_pos, buf, count);
+```
+
+#### 6.block_write块设备文件读写
+
+具体定义在位于文件[../fs/block_dev.c](../fs/block_dev.c)
+
+- 1.block._dev.c介绍：
+
+block_dev.c 程序属于`块设备文件数据访问操作类程序`。
+该文件包括`block_read() ` 和`block_write()`两个`块设备读写函数`。 
+这两个函数是`供系统调用函数read() 和 write()` 调用的， 其 他 地 方 没 有 引 用 。
+
+======
+
+- 2.函数block_write介绍：
+
+Linux 早期内核中的块设备写操作函数，核心功能是`将用户空间缓冲区 buf 中的数据`，`写入到指定块设备 dev 的对应位置`（由 `pos 指向的偏移量决定`），写入长度为` count 字节`，最终`返回实际成功写入的字节数`（写入失败时返回 -EIO 表示 I/O 错误）
+
+```c
+int block_write(int dev, long *pos, char *buf, int count)
+{
+    int block = *pos >> BLOCK_SIZE_BITS;  // 计算当前位置所在的块号
+                                          // BLOCK_SIZE_BITS是块大小的对数（如10表示块大小1024字节）
+    int offset = *pos & (BLOCK_SIZE - 1); // 使用位运算范围操作计算在块内的偏移量（BLOCK_SIZE是块大小，如1024）
+    int chars;                            // 本次要处理的字节数
+    int written = 0;                      // 已写入的总字节数
+    struct buffer_head *bh;               // 缓冲区头指针，用于管理磁盘块缓存
+    register char *p;                     // 指向缓冲区中实际数据的指针（寄存器变量，速度更快）
+
+    // 循环处理所有要写入的数据，直到count减为0
+    while (count > 0)
+    {
+        // 计算当前块中可写入的字节数（从偏移量到块末尾）
+        chars = BLOCK_SIZE - offset;
+        // 如果剩余要写入的字节数小于当前块可写空间，则只写入剩余字节
+        if (chars > count)
+            chars = count;
+
+        // 获取缓冲区：如果要写满一整块，直接分配新块；否则预读后续块提升性能
+        if (chars == BLOCK_SIZE)
+            bh = getblk(dev, block); // 获取指定设备和块号的缓冲区（不读取数据）
+        else
+            // 读取当前块并预读后续2个块（-1表示结束），提升连续读写性能
+            bh = breada(dev, block, block + 1, block + 2, -1);
+
+        block++; // 准备处理下一个块
+        // 如果获取缓冲区失败，返回已写入的字节数（如果有）或错误码
+        if (!bh)
+            return written ? written : -EIO;
+        // 设置数据指针：缓冲区数据起始位置 + 偏移量
+        p = offset + bh->b_data;
+        offset = 0; // 下一次将从新块的开头开始写入，所以偏移量重置为0
+        *pos += chars;    // 更新文件位置
+        written += chars; // 更新已写入字节数
+        count -= chars;   // 更新剩余要写入的字节数
+        // 将用户空间缓冲区的数据复制到内核缓冲区
+        while (chars-- > 0)
+            *(p++) = get_fs_byte(buf++); // get_fs_byte从用户空间读取一个字节
+        bh->b_dirt = 1; // 标记缓冲区为"脏"（数据已修改，需要写回磁盘）
+        brelse(bh);     // 释放缓冲区（将其放回空闲链表，可能触发写回）
+    }
+    return written; // 返回成功写入的总字节数
+}
+
+```
+好了，现在我们来整体梳理一下这个函数：
+
+##### 6.1 getblk实现：
+函数具体定义位于文件[../fs/buffer.c](../fs/buffer.c)中
+整体实现逻辑如下：
+- 1.总目标：
+找到一个合适的缓冲区，用于存储指定设备 dev 上的块 block。
+
+- 2.具体流程：
+
+核心目标是`高效管理内核块缓冲区缓存`（buffer cache），遵循「`先查缓存，再找空闲，无空闲则等待`」的逻辑，
+最终返回一个`满足要求的缓冲区`：**未被占用、未锁定、干净（无脏数据）**，且`与目标设备 / 块绑定`。
+
+```c
+struct buffer_head * getblk(int dev,int block)
+{
+	struct buffer_head * tmp, * bh;
+
+repeat:
+	if ((bh = get_hash_table(dev,block)))
+		return bh;
+	tmp = free_list;
+	do {
+		if (tmp->b_count)
+			continue;
+		if (!bh || BADNESS(tmp)<BADNESS(bh)) {
+			bh = tmp;
+			if (!BADNESS(tmp))
+				break;
+		}
+/* and repeat until we find something good */
+	} while ((tmp = tmp->b_next_free) != free_list);
+	if (!bh) {
+		sleep_on(&buffer_wait);
+		goto repeat;
+	}
+	wait_on_buffer(bh);
+	if (bh->b_count)
+		goto repeat;
+	while (bh->b_dirt) {
+		sync_dev(bh->b_dev);
+		wait_on_buffer(bh);
+		if (bh->b_count)
+			goto repeat;
+	}
+/* NOTE!! While we slept waiting for this block, somebody else might */
+/* already have added "this" block to the cache. check it */
+	if (find_buffer(dev,block))
+		goto repeat;
+/* OK, FINALLY we know that this buffer is the only one of it's kind, */
+/* and that it's unused (b_count=0), unlocked (b_lock=0), and clean */
+	bh->b_count=1;
+	bh->b_dirt=0;
+	bh->b_uptodate=0;
+	remove_from_queues(bh);
+	bh->b_dev=dev;
+	bh->b_blocknr=block;
+	insert_into_queues(bh);
+	return bh;
+}
+```
+那显然，在这里我们逐一讲解此函数：
+
+##### 6.2.参数：
+```c
+struct buffer_head * getblk(int dev,int block)
+```
+`dev + block`, 形成了`系统级别的唯一标识`，能够精准定位「**某台块设备上的某一个逻辑数据块**」，这也是**块缓存哈希表**的**核心索引键**，保证了 getblk() 能**快速查找**、**复用对应缓冲区**，同时**避免缓冲区**与**数据块**的错误绑定。
+
+##### 6.3 返回值：
+一个`与目标设备 / 块绑定`、`未被占用（仅当前进程引用）`、`干净无脏数据`、`已纳入块缓存管理`的缓冲区，返回该缓冲区给调用者（如 block_write()），用于后续的写入操作。
+
+##### 6.4 buffer_head结构体
+显然，需要对`buffer_head`结构体进行介绍：
+他的定义位于文件：[../include/linux/fs.h](../include/linux/fs.h)
+
+---
+- 1.fs.h的作用
+这个文件（fs.h）是`操作系统内核`中`文件系统模块`的核心头文件，它的主要作用是`定义文件系统`实现所需的`数据结构、常量、宏和函数接口`，为整个文件系统的运作提供基础框架。
+
+简单说，这个文件是操作系统文件系统的` “设计蓝图”`—— 所有文件的`创建、读写、删除，目录`的管理，`设备的访问`等操作，都依赖于它定义的`数据结构和接口`来实现。
+
+它让内核能够`统一管理磁盘上的文件和数据`，是用户与存储设备之间交互的核心桥梁。
+
+
+- 2.buffer_head的解析：
+
+- 2.1 作用：
+`buffer_head`结构体是`文件系统模块`中`最基本的`数据结构，用于`缓存磁盘上的块数据`。
+每个`缓冲区`（buffer）都对应着磁盘上的一个`物理块`（通常是 1024 字节），
+`buffer_head`结构体包含了`关于该块的元数据`，如`设备号、块号、数据指针、状态标志（脏/干净、占用/空闲）`等。
+
+- 2.2 解析：
+
+这里最经典的就是`两对4个`指针，分别是：
+
+- 1. `b_prev`和`b_next`：这一对指针用于将缓冲区链接到`哈希表`中，
+  以便快速根据`设备号和块号`查找`缓冲区`。
+
+- 2. `b_prev_free`和`b_next_free`：这一对指针用于将缓冲区链接到`空闲链表`中，
+  以便在需要时`快速分配新的缓冲区`。
+
+这里其实是第一对指针不好理解，先说说哈希表的实现：
+
+###### hash的实现
+
+hash的实现分别在文件[../fs/buffer.c](../fs/buffer.c)和[../include/linux/fs.h](../include/linux/fs.h)中定义。
+重点在[../fs/buffer.c](../fs/buffer.c)中。
+
+本质还是`数组形式哈希表`。
+```c
+//307个哈希槽数
+#define NR_HASH 307
+
+//哈希表，数组槽的形式
+struct buffer_head * hash_table[NR_HASH];
+
+//哈希函数，将设备号和块号映射到哈希槽数，很有趣的一个算法，
+//通过异或操作将设备号和块号混合起来，再取模得到哈希槽数
+
+//补充，这里其实可以使用&(NR_HASH-1)来替代%NR_HASH，更加高效
+//自己的补充： #define _hashfn(dev,block) (((unsigned)(dev^block))&(NR_HASH-1))
+
+#define _hashfn(dev,block) (((unsigned)(dev^block))%NR_HASH)
+
+//哈希表的查找函数，将设备号和块号映射到哈希槽数，再从哈希槽中查找缓冲区
+#define hash(dev,block) hash_table[_hashfn(dev,block)]
+
+//插入函数才是精髓，直接体现哈希表的精髓。
+static inline void insert_into_queues(struct buffer_head * bh)
+{
+/* put at end of free list */
+	bh->b_next_free = free_list;
+	bh->b_prev_free = free_list->b_prev_free;
+	free_list->b_prev_free->b_next_free = bh;
+	free_list->b_prev_free = bh;
+/* put the buffer in new hash-queue if it has a device */
+	bh->b_prev = NULL;
+	bh->b_next = NULL;
+	if (!bh->b_dev)
+		return;
+	bh->b_next = hash(bh->b_dev,bh->b_blocknr);
+	hash(bh->b_dev,bh->b_blocknr) = bh;
+	bh->b_next->b_prev = bh;
+}
+
+static inline void remove_from_queues(struct buffer_head * bh)
+{
+/* remove from hash-queue */
+	if (bh->b_next)
+		bh->b_next->b_prev = bh->b_prev;
+	if (bh->b_prev)
+		bh->b_prev->b_next = bh->b_next;
+	if (hash(bh->b_dev,bh->b_blocknr) == bh)
+		hash(bh->b_dev,bh->b_blocknr) = bh->b_next;
+/* remove from free list */
+	if (!(bh->b_prev_free) || !(bh->b_next_free))
+		panic("Free block list corrupted");
+	bh->b_prev_free->b_next_free = bh->b_next_free;
+	bh->b_next_free->b_prev_free = bh->b_prev_free;
+	if (free_list == bh)
+		free_list = bh->b_next_free;
+}
+
+static struct buffer_head * find_buffer(int dev, int block)
+{		
+	struct buffer_head * tmp;
+
+	for (tmp = hash(dev,block) ; tmp != NULL ; tmp = tmp->b_next)
+		if (tmp->b_dev==dev && tmp->b_blocknr==block)
+			return tmp;
+	return NULL;
+}
+struct buffer_head * get_hash_table(int dev, int block)
+{
+	struct buffer_head * bh;
+
+	for (;;) {
+		if (!(bh=find_buffer(dev,block)))
+			return NULL;
+		bh->b_count++;
+		wait_on_buffer(bh);
+		if (bh->b_dev == dev && bh->b_blocknr == block)
+			return bh;
+		bh->b_count--;
+	}
+}
+```
+
+
+- 2.3 整体块管理架构
+
+在此我们的`块缓冲区`整体架构就大致明晰了：
+
+![`块缓冲区`整体架构](image-19.png)
+
+
+
+- 2.4缓冲头和缓冲块的精妙配合
+
+先看图：
+
+![缓冲头和缓冲块的精妙配合，确保空间有限不溢出，且块相互联系](image-20.png)
+
+这张图挺好的！
+精妙之至：
+- 确保空间有限不溢出=>头正向增长，块负向增长！
+- 块相互联系=>缓冲头前后指针设置，O(1)删改！
+
+> 缓冲头和缓冲块相互合作`共同定义缓冲区的工作`。因为`缓冲块能分多少不知道，所以需要从末尾往前面增长`，
+而我们的缓冲指针头正向增长！这是很睿智的设置，确保最大化利用有限的内存空间！
+
+```c
+// 缓冲区头结构，用于管理磁盘缓冲区
+struct buffer_head
+{
+    char *b_data;            /* pointer to data block (1024 bytes) */
+    unsigned long b_blocknr; /* block number */
+    unsigned short b_dev;    /* device (0 = free) */
+    unsigned char b_uptodate; /* 数据是否最新 */
+    unsigned char b_dirt;  /* 0-clean,1-dirty 数据是否修改过 */
+    unsigned char b_count; /* 使用该块的用户数 */
+    unsigned char b_lock;  /* 0 - ok, 1 -locked 是否锁定 */
+    struct task_struct *b_wait;/* 等待该缓冲区的任务 */
+    struct buffer_head *b_prev;/* 哈希表前向指针 */
+    struct buffer_head *b_next;/* 哈希表后向指针 */
+    struct buffer_head *b_prev_free;/* 空闲链表前向指针 */
+    struct buffer_head *b_next_free;/* 空闲链表后向指针 */
+};
+```
+
+

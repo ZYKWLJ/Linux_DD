@@ -2948,6 +2948,24 @@ struct buffer_head * getblk(int dev,int block)
 显然，需要对`buffer_head`结构体进行介绍：
 他的定义位于文件：[../include/linux/fs.h](../include/linux/fs.h)
 
+```c
+// 缓冲区头结构，用于管理磁盘缓冲区
+struct buffer_head
+{
+    char *b_data;            /* pointer to data block (1024 bytes) */
+    unsigned long b_blocknr; /* block number */
+    unsigned short b_dev;    /* device (0 = free) */
+    unsigned char b_uptodate; /* 数据是否最新 */
+    unsigned char b_dirt;  /* 0-clean,1-dirty 数据是否修改过 */
+    unsigned char b_count; /* 使用该块的用户数 */
+    unsigned char b_lock;  /* 0 - ok, 1 -locked 是否锁定 */
+    struct task_struct *b_wait;/* 等待该缓冲区的任务 */
+    struct buffer_head *b_prev;/* 哈希表前向指针 */
+    struct buffer_head *b_next;/* 哈希表后向指针 */
+    struct buffer_head *b_prev_free;/* 空闲链表前向指针 */
+    struct buffer_head *b_next_free;/* 空闲链表后向指针 */
+};
+```
 ---
 - 1.fs.h的作用
 这个文件（fs.h）是`操作系统内核`中`文件系统模块`的核心头文件，它的主要作用是`定义文件系统`实现所需的`数据结构、常量、宏和函数接口`，为整个文件系统的运作提供基础框架。
@@ -3000,24 +3018,63 @@ struct buffer_head * hash_table[NR_HASH];
 //哈希表的查找函数，将设备号和块号映射到哈希槽数，再从哈希槽中查找缓冲区
 #define hash(dev,block) hash_table[_hashfn(dev,block)]
 
+```
+#### 插入操作：
+
+即**哈希+双链表**，哈希用来`O(1)查找`，双链表用来`O(1)插入删除`。
+
+还是得回到这张图：
+
+![`块缓冲区`整体架构](image-19.png)
+
+> free_list指向了缓冲头双向链表的`第一个结构`，然后顺着这个结构，就可以在双向链表中`遍历到任何一个缓冲头结构了`，而通过缓冲头又可以找到这个`缓冲头对应的缓冲块`。
+
+>简单地说，**缓冲头就是具体缓冲块的管理结构**，而**free list开头的双向链表又是缓冲头的管理结构**，整个管理体系就这样建立起来了。
+
+##### 缓冲块双向链表和哈希表的关联如图
+
+![缓冲块双向链表和哈希表的关联如图](image-21.png)
+
+**所以这才是哈希+双向list的管理哲学！**
+
+```c
+static struct buffer_head * free_list;//free_list是定义在buffer.c里面的静态变量！
+
 //插入函数才是精髓，直接体现哈希表的精髓。
 static inline void insert_into_queues(struct buffer_head * bh)
 {
 /* put at end of free list */
-	bh->b_next_free = free_list;
+//因为free_list指向了第一个缓冲头结构，所以这里是将新的缓冲头插入到空闲链表的头部。
+//即空闲节点和原本的第一个节点之间！
+//这里的实现逻辑是：
+// free_list<-->old_node
+// free_list<-->new_node<-->old_node
+// linus实现的是往左N，往右P
+    bh->b_next_free = free_list;
 	bh->b_prev_free = free_list->b_prev_free;
 	free_list->b_prev_free->b_next_free = bh;
 	free_list->b_prev_free = bh;
+
 /* put the buffer in new hash-queue if it has a device */
 	bh->b_prev = NULL;
 	bh->b_next = NULL;
 	if (!bh->b_dev)
-		return;
+		return; //没有设备直接返回
+    //有设备，将缓冲头插入到哈希表中
 	bh->b_next = hash(bh->b_dev,bh->b_blocknr);
-	hash(bh->b_dev,bh->b_blocknr) = bh;
+    //哈希里面就是存的缓冲头，所以本身就是链表数组。
+	hash(bh->b_dev,bh->b_blocknr) = bh;//将缓冲头插入到哈希表中，这里变成赋值了？？！！！
+    //最经典的是这里怎么处理冲突的？
+    //====>部分储存法则，即如若冲突，后来者占用哈希槽，但是原来在这个槽里面的节点，就被链接在哈希双链表上。
+    //但是后续怎么查询的？这又是一大招，我猜是两个槽之间查询的的。
 	bh->b_next->b_prev = bh;
 }
 
+```
+#### 删除操作：
+
+```c
+// 
 static inline void remove_from_queues(struct buffer_head * bh)
 {
 /* remove from hash-queue */
@@ -3035,7 +3092,9 @@ static inline void remove_from_queues(struct buffer_head * bh)
 	if (free_list == bh)
 		free_list = bh->b_next_free;
 }
+```
 
+```c
 static struct buffer_head * find_buffer(int dev, int block)
 {		
 	struct buffer_head * tmp;
@@ -3045,6 +3104,10 @@ static struct buffer_head * find_buffer(int dev, int block)
 			return tmp;
 	return NULL;
 }
+```
+
+```c
+
 struct buffer_head * get_hash_table(int dev, int block)
 {
 	struct buffer_head * bh;

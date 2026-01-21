@@ -3050,6 +3050,7 @@ static inline void insert_into_queues(struct buffer_head * bh)
 // free_list<-->old_node
 // free_list<-->new_node<-->old_node
 // linus实现的是往左N，往右P
+
     bh->b_next_free = free_list;
 	bh->b_prev_free = free_list->b_prev_free;
 	free_list->b_prev_free->b_next_free = bh;
@@ -3065,13 +3066,14 @@ static inline void insert_into_queues(struct buffer_head * bh)
     //哈希里面就是存的缓冲头，所以本身就是链表数组。
 	hash(bh->b_dev,bh->b_blocknr) = bh;//将缓冲头插入到哈希表中，这里变成赋值了？？！！！
     //最经典的是这里怎么处理冲突的？
-    //====>部分储存法则，即如若冲突，后来者占用哈希槽，但是原来在这个槽里面的节点，就被链接在哈希双链表上。
-    //但是后续怎么查询的？这又是一大招，我猜是两个槽之间查询的的。
+    //还是拉链法
 	bh->b_next->b_prev = bh;
 }
 
 ```
 #### 删除操作：
+
+将 buffer_head 从`哈希队列`和`空闲链表`这两个`内核缓存管理链表`中安全摘除；
 
 ```c
 // 
@@ -3084,15 +3086,26 @@ static inline void remove_from_queues(struct buffer_head * bh)
 		bh->b_prev->b_next = bh->b_next;
 	if (hash(bh->b_dev,bh->b_blocknr) == bh)
 		hash(bh->b_dev,bh->b_blocknr) = bh->b_next;
+
 /* remove from free list */
-	if (!(bh->b_prev_free) || !(bh->b_next_free))
+	if (!(bh->b_prev_free) || !(bh->b_next_free))//这一步啥意思？
+    //在早期 Linux 内核中，空闲的 buffer_head 被组织成一个循环双向链表（环形链表）。环形链表的特点是：链表中没有任何节点的前驱 / 后继指针为 NULL（头节点的前驱指向尾节点，尾节点的后继指向头节点）。
 		panic("Free block list corrupted");
+
 	bh->b_prev_free->b_next_free = bh->b_next_free;
 	bh->b_next_free->b_prev_free = bh->b_prev_free;
 	if (free_list == bh)
 		free_list = bh->b_next_free;
 }
 ```
+
+#### 查找操作：
+
+查找函数的实现逻辑是：
+- 先根据设备号和块号映射到哈希槽数，再从哈希槽中查找缓冲区。
+- 如果哈希槽中没有缓冲区，直接返回 NULL。
+- 如果哈希槽中有缓冲区，就遍历这个链表，直到找到匹配的缓冲区，或者遍历完整个链表。
+- 如果遍历完整个链表，没有找到匹配的缓冲区，也返回 NULL。
 
 ```c
 static struct buffer_head * find_buffer(int dev, int block)
@@ -3106,6 +3119,11 @@ static struct buffer_head * find_buffer(int dev, int block)
 }
 ```
 
+#### 安全加固查找操作：
+
+简单说：`get_hash_table()` 依赖 `find_buffer()` 完成` “定位”`，自己完成 `“确保可用”`。
+
+
 ```c
 
 struct buffer_head * get_hash_table(int dev, int block)
@@ -3114,16 +3132,92 @@ struct buffer_head * get_hash_table(int dev, int block)
 
 	for (;;) {
 		if (!(bh=find_buffer(dev,block)))
-			return NULL;
-		bh->b_count++;
-		wait_on_buffer(bh);
+			return NULL;//如果没有找到缓冲块
+		bh->b_count++;//找到了块的计数+1
+		wait_on_buffer(bh);//等待缓冲区就绪
+
+        //关键校验（find_buffer的结果可能已失效）
 		if (bh->b_dev == dev && bh->b_blocknr == block)
 			return bh;
+        //校验失败，释放引用计数，重新查找
 		bh->b_count--;
 	}
 }
 ```
 
+同时，这里的`wait_on_buffer`作用是：
+
+- 等待缓冲区就绪
+
+
+> wait_on_buffer 是一个`自旋等待（阻塞）函数`，作用是：当传入的 `buffer_head（缓冲区头）`被`加锁（b_lock 为真）`时，**调用者进程会进入睡眠状态**，直到该缓冲区`被解锁（b_lock 为假）`后才被唤醒，继续执行。简单说，就是 **“等缓冲区解锁”。**
+
+
+#### 等待解锁的本质
+
+进程为了安全等到 `bh->b_lock=0`，`主动阻塞（放弃 CPU）`、`挂载等待队列`，直到`被唤醒后`重新验证状态的`内核同步与调度行为`；
+
+bh->b_lock 是一个状态标志位：
+
+bh->b_lock=1：`缓冲区被锁定`（有进程在操作，比如`写磁盘、修改缓存`）；
+
+bh->b_lock=0：`缓冲区解锁`（空闲，可`被其他进程操作`）。
+
+
+- 标记为 static inline 
+
+是为了减少函数调用开销 —— 这个函数会被频繁调用（每次操作缓冲区都可能触发），`内联展开能提升执行效率`；
+
+
+```c
+static inline void wait_on_buffer(struct buffer_head * bh)
+{
+	cli();//这里关闭中断是为了让cli()和sti()之间的操作是原子的，防止被中断打断。
+	while (bh->b_lock)
+		sleep_on(&bh->b_wait);//缓冲块上存储了一系列的使用该缓冲块的进程，当缓冲块解锁后，会唤醒这些进程。
+	sti();
+}
+```
+其中：
+cli()、sti()的实现是,内联宏定义：
+
+```c
+#define sti() __asm__ ("sti"::)
+#define cli() __asm__ ("cli"::)
+```
+>cli()	Clear Interrupt 的缩写	关闭当前 CPU 的中断响应（内核态指令），防止睡眠过程中被中断打断，保证操作的原子性
+
+>sti()	Set Interrupt 的缩写	重新开启 CPU 中断响应，恢复正常中断处理
+
+而sleep的实现早就说了，自行于上文查看。
+
+#### 为啥要关中断cli()？
+
+早期 Linux 内核的`中断处理`和`进程调度`是`强耦合`的：
+
+>关闭中断可以防止在 `“检查锁状态 → 执行睡眠”` 的`间隙被中断打断`，避免出现 `“锁刚释放，但进程已经睡下去”` 的`竞态条件`；
+保证 while 循环内的操作是 `“原子的”，不会被外部中断干扰。`
+
+>注意：这种直接关中断的方式是`早期内核的简化实现`，现代内核会用`更安全的自旋锁 / 信号量机制`，**不再直接关全局中断。**
+
+
+----
+而后续，进行的一系列检测：
+
+```c
+//关键校验: find_buffer() 找到 bh 后，到 wait_on_buffer(bh) 这段时间，`bh 可能被其他进程修改`（比如`被移除哈希表、设备号 / 块号被修改`）；所以 get_hash_table() 在等待缓冲区就绪后，`必须重新校验 bh->b_dev 和 bh->b_blocknr`，确保`这还是我们要找的那个缓冲区`；
+if (bh->b_dev == dev && bh->b_blocknr == block)
+    return bh;
+//校验失败，释放引用计数，重新查找
+bh->b_count--;
+```
+如果校验失败，说明 find_buffer() 的结果已经失效，需要`释放引用计数（bh->b_count--）`，`重新调用 find_buffer() 查找`。
+
+好了，一个简简单单的哈希函数获取缓冲块的函数，牵扯出这么多的知识——“锁”、“中断”等等，现在终于结束了，你明白了吗？！！
+
+> 至此，内核中的哈希函数实现就结束了！看不过瘾？再来一次！
+
+----
 
 - 2.3 整体块管理架构
 
@@ -3139,9 +3233,12 @@ struct buffer_head * get_hash_table(int dev, int block)
 
 ![缓冲头和缓冲块的精妙配合，确保空间有限不溢出，且块相互联系](image-20.png)
 
+
 这张图挺好的！
+
 精妙之至：
 - 确保空间有限不溢出=>头正向增长，块负向增长！
+
 - 块相互联系=>缓冲头前后指针设置，O(1)删改！
 
 > 缓冲头和缓冲块相互合作`共同定义缓冲区的工作`。因为`缓冲块能分多少不知道，所以需要从末尾往前面增长`，

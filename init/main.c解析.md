@@ -3254,7 +3254,7 @@ struct buffer_head
     unsigned char b_uptodate; /* 数据是否最新 */
     unsigned char b_dirt;  /* 0-clean,1-dirty 数据是否修改过 */
     unsigned char b_count; /* 使用该块的用户数 */
-    unsigned char b_lock;  /* 0 - ok, 1 -locked 是否锁定 */
+    unsigned char b_lock;  /* 0 - ok, 1 -locked 是否锁定 ,即被其他缓冲区占用*/
     struct task_struct *b_wait;/* 等待该缓冲区的任务 */
     struct buffer_head *b_prev;/* 哈希表前向指针 */
     struct buffer_head *b_next;/* 哈希表后向指针 */
@@ -3263,4 +3263,69 @@ struct buffer_head
 };
 ```
 
+#### 回到getblk()，重新捋一捋
 
+还记得我们是从`getblk()`函数一路走到这里的，现在，重新给出：
+```c
+struct buffer_head * getblk(int dev,int block)
+{
+	struct buffer_head * tmp, * bh;
+
+repeat:
+	if ((bh = get_hash_table(dev,block)))
+		return bh;
+	tmp = free_list;
+	do {
+		if (tmp->b_count)
+			continue;
+		if (!bh || BADNESS(tmp)<BADNESS(bh)) {
+			bh = tmp;
+			if (!BADNESS(tmp))
+				break;
+		}
+/* and repeat until we find something good */
+	} while ((tmp = tmp->b_next_free) != free_list);
+	if (!bh) {
+		sleep_on(&buffer_wait);
+		goto repeat;
+	}
+	wait_on_buffer(bh);
+	if (bh->b_count)
+		goto repeat;
+	while (bh->b_dirt) {
+		sync_dev(bh->b_dev);
+		wait_on_buffer(bh);
+		if (bh->b_count)
+			goto repeat;
+	}
+/* NOTE!! While we slept waiting for this block, somebody else might */
+/* already have added "this" block to the cache. check it */
+	if (find_buffer(dev,block))
+		goto repeat;
+/* OK, FINALLY we know that this buffer is the only one of it's kind, */
+/* and that it's unused (b_count=0), unlocked (b_lock=0), and clean */
+	bh->b_count=1;
+	bh->b_dirt=0;
+	bh->b_uptodate=0;
+	remove_from_queues(bh);
+	bh->b_dev=dev;
+	bh->b_blocknr=block;
+	insert_into_queues(bh);
+	return bh;
+}
+```
+
+那么现在，我们再来看看剩下的几个点：
+##### 1.BADNESS宏：
+
+BADNESS宏具体定义位于文件[../fs/buffer.c](../fs/buffer.c)中
+
+```c
+#define BADNESS(bh) (((bh)->b_dirt<<1)+(bh)->b_lock)//让脏标志的权重高于锁标志；具体是两倍。
+```
+- 主要作用：评分
+
+>BADNESS(bh) 是一个`优先级评分宏`，用于计算一个 buffer_head（缓冲区头）的 `“糟糕程度”（不可用程度）`，返回一个 `0-3 之间的整数评分`。评分越高，`说明该缓冲区越 “差”`（越不适合被淘汰 / 复用）；评分越低，说明越 “好”（越适合被选中复用）
+
+具体如下：
+![BADNESS评分缓冲块的宏](image-22.png)
